@@ -53,7 +53,9 @@ func (b *Ext4ImageBuilder) Save() error {
 		}
 	}
 
-	fmt.Printf("✓ Image saved to: %s (%d MB)\n", b.imagePath, b.totalSize/(1024*1024))
+	if DEBUG {
+		fmt.Printf("✓ Image saved to: %s (%d MB)\n", b.imagePath, b.totalSize/(1024*1024))
+	}
 	return nil
 }
 

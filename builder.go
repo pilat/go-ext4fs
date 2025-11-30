@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// DEBUG controls whether debug output is printed during ext4 filesystem operations.
+// Set to false to disable all debug printing.
+var DEBUG = false
+
 // Ext4ImageBuilder handles the creation of ext4 images backed by a diskBackend.
 type Ext4ImageBuilder struct {
 	disk           diskBackend
@@ -95,8 +99,10 @@ func (b *Ext4ImageBuilder) CreateDirectory(parentInodeNum uint32, name string, m
 	parentInode.LinksCount++
 	b.writeInode(parentInodeNum, parentInode)
 
-	fmt.Printf("  ✓ Created directory: %s (inode %d, uid=%d, gid=%d, mode=%04o)\n",
-		name, newInodeNum, uid, gid, mode)
+	if DEBUG {
+		fmt.Printf("  ✓ Created directory: %s (inode %d, uid=%d, gid=%d, mode=%04o)\n",
+			name, newInodeNum, uid, gid, mode)
+	}
 
 	return newInodeNum
 }
@@ -159,8 +165,10 @@ func (b *Ext4ImageBuilder) CreateFile(parentInodeNum uint32, name string, conten
 		Name:     []byte(name),
 	})
 
-	fmt.Printf("  ✓ Created file: %s (inode %d, size=%d, uid=%d, gid=%d, mode=%04o)\n",
-		name, newInodeNum, size, uid, gid, mode)
+	if DEBUG {
+		fmt.Printf("  ✓ Created file: %s (inode %d, size=%d, uid=%d, gid=%d, mode=%04o)\n",
+			name, newInodeNum, size, uid, gid, mode)
+	}
 
 	return newInodeNum
 }
@@ -211,8 +219,10 @@ func (b *Ext4ImageBuilder) overwriteFile(inodeNum uint32, content []byte, mode, 
 	fileInode.BlocksLo = blocksNeeded * (BlockSize / 512)
 	b.writeInode(inodeNum, fileInode)
 
-	fmt.Printf("  ✓ Overwritten file: %s (inode %d, size=%d, uid=%d, gid=%d, mode=%04o)\n",
-		name, inodeNum, size, uid, gid, mode)
+	if DEBUG {
+		fmt.Printf("  ✓ Overwritten file: %s (inode %d, size=%d, uid=%d, gid=%d, mode=%04o)\n",
+			name, inodeNum, size, uid, gid, mode)
+	}
 
 	return inodeNum
 }
@@ -264,7 +274,9 @@ func (b *Ext4ImageBuilder) CreateSymlink(parentInodeNum uint32, name, target str
 		Name:     []byte(name),
 	})
 
-	fmt.Printf("  ✓ Created symlink: %s -> %s (inode %d)\n", name, target, newInodeNum)
+	if DEBUG {
+		fmt.Printf("  ✓ Created symlink: %s -> %s (inode %d)\n", name, target, newInodeNum)
+	}
 
 	return newInodeNum
 }
@@ -304,7 +316,9 @@ func (b *Ext4ImageBuilder) CreateLostFound() uint32 {
 	rootInode.LinksCount++
 	b.writeInode(RootInode, rootInode)
 
-	fmt.Println("✓ Created lost+found directory")
+	if DEBUG {
+		fmt.Println("✓ Created lost+found directory")
+	}
 
 	return lfInode
 }
@@ -506,7 +520,9 @@ func (b *Ext4ImageBuilder) writeMBR() {
 	binary.Write(buf, binary.LittleEndian, mbr)
 	b.writeAt(0, buf.Bytes())
 
-	fmt.Println("✓ MBR written with Linux partition")
+	if DEBUG {
+		fmt.Println("✓ MBR written with Linux partition")
+	}
 }
 
 // calculateGroupOverhead calculates the overhead blocks at the start of a group
@@ -605,8 +621,10 @@ func (b *Ext4ImageBuilder) writeSuperblock() {
 
 	b.writeAt(b.partOffset(1024), buf.Bytes())
 
-	fmt.Printf("✓ Superblock written (blocks: %d, inodes: %d, groups: %d)\n",
-		b.blockCount, b.inodesCount, b.groupCount)
+	if DEBUG {
+		fmt.Printf("✓ Superblock written (blocks: %d, inodes: %d, groups: %d)\n",
+			b.blockCount, b.inodesCount, b.groupCount)
+	}
 }
 
 // writeGroupDescriptors writes group descriptors.
@@ -661,7 +679,9 @@ func (b *Ext4ImageBuilder) writeGroupDescriptors() {
 		b.writeAt(gdtOffset+uint64(g*32), buf.Bytes())
 	}
 
-	fmt.Printf("✓ Group descriptors written (%d groups)\n", b.groupCount)
+	if DEBUG {
+		fmt.Printf("✓ Group descriptors written (%d groups)\n", b.groupCount)
+	}
 }
 
 // writeBitmaps writes block and inode bitmaps.
@@ -739,7 +759,9 @@ func (b *Ext4ImageBuilder) writeBitmaps() {
 		b.writeAt(b.blockOffset(inodeBitmapBlock), inodeBitmap)
 	}
 
-	fmt.Println("✓ Block and inode bitmaps written")
+	if DEBUG {
+		fmt.Println("✓ Block and inode bitmaps written")
+	}
 }
 
 // writeRootDirectory creates the root directory.
@@ -769,7 +791,9 @@ func (b *Ext4ImageBuilder) writeRootDirectory() {
 	// Mark inode as used in bitmap
 	b.markInodeUsed(RootInode)
 
-	fmt.Println("✓ Root directory created")
+	if DEBUG {
+		fmt.Println("✓ Root directory created")
+	}
 }
 
 // createDirInode creates an inode for a directory
