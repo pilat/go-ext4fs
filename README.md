@@ -5,7 +5,7 @@ Pure Go ext4 filesystem implementation for creating disk images without external
 ## Installation
 
 ```bash
-go get github.com/pilat/ext4
+go get github.com/pilat/go-ext4fs
 ```
 
 ## Usage
@@ -14,12 +14,12 @@ go get github.com/pilat/ext4
 package main
 
 import (
-    "github.com/pilat/ext4"
+    "github.com/pilat/ext4fs"
 )
 
 func main() {
     // Create 64MB ext4 image
-    builder, err := ext4.NewExt4ImageBuilder("disk.img", 64)
+    builder, err := ext4fs.NewExt4ImageBuilder("disk.img", 64)
     if err != nil {
         panic(err)
     }
@@ -28,7 +28,7 @@ func main() {
     builder.PrepareFilesystem()
 
     // Create directories and files
-    etcDir := builder.CreateDirectory(ext4.RootInode, "etc", 0755, 0, 0)
+    etcDir := builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
     builder.CreateFile(etcDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
 
     // Finalize and save

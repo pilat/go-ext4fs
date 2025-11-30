@@ -1,4 +1,4 @@
-package ext4
+package ext4fs
 
 // isSparseGroup checks if a group should have superblock backup (sparse superblock layout).
 func isSparseGroup(group uint32) bool {

@@ -1,4 +1,4 @@
-package ext4_test
+package ext4fs_test
 
 import (
 	"bytes"
@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pilat/ext4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

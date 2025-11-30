@@ -1,4 +1,4 @@
-module github.com/pilat/ext4
+module github.com/pilat/go-ext4fs
 
 go 1.24.5
 
