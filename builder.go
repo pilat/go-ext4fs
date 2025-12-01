@@ -684,7 +684,7 @@ func (b *Ext4ImageBuilder) writeGroupDescriptors() {
 	}
 }
 
-// writeBitmaps writes block and inode bitmaps.
+// writeBitmaps writes block and inode bitmaps and initializes inode tables.
 func (b *Ext4ImageBuilder) writeBitmaps() {
 	for g := uint32(0); g < b.groupCount; g++ {
 		groupStart := g * BlocksPerGroup
@@ -693,9 +693,10 @@ func (b *Ext4ImageBuilder) writeBitmaps() {
 
 		blockBitmapBlock := groupStart + overhead
 		inodeBitmapBlock := blockBitmapBlock + 1
+		inodeTableBlock := inodeBitmapBlock + 1
 		inodeTableBlocks := uint32((InodesPerGroup*InodeSize + BlockSize - 1) / BlockSize)
 
-		// Create block bitmap
+		// Create block bitmap - CRITICAL: Initialize all bytes to 0
 		blockBitmap := make([]byte, BlockSize)
 
 		// Total overhead = group overhead + bitmaps + inode table
@@ -713,13 +714,15 @@ func (b *Ext4ImageBuilder) writeBitmaps() {
 		}
 
 		// Mark blocks beyond this group's valid range as used (padding)
+		// IMPORTANT: This ensures the kernel doesn't try to allocate non-existent blocks
 		for i := blocksInGroup; i < BlocksPerGroup; i++ {
 			blockBitmap[i/8] |= 1 << (i % 8)
 		}
 
-		// Also mark any remaining bytes as 0xFF for padding beyond BlocksPerGroup
-		bitmapBitsUsed := BlocksPerGroup
-		bitmapBytesUsed := (bitmapBitsUsed + 7) / 8
+		// Mark remaining bytes in the bitmap block as 0xFF
+		// The bitmap can hold BlocksPerGroup bits, which is 32768 bits = 4096 bytes
+		// So normally this loop does nothing, but it's defensive programming
+		bitmapBytesUsed := (BlocksPerGroup + 7) / 8
 		for i := bitmapBytesUsed; i < BlockSize; i++ {
 			blockBitmap[i] = 0xFF
 		}
@@ -757,10 +760,18 @@ func (b *Ext4ImageBuilder) writeBitmaps() {
 		}
 
 		b.writeAt(b.blockOffset(inodeBitmapBlock), inodeBitmap)
+
+		// CRITICAL FIX: Zero out the inode table to prevent reading garbage data
+		// When inodes are allocated later, they must start from a clean state
+		// This prevents the "bad header/extent" errors when the kernel reads uninitialized extents
+		zeroBlock := make([]byte, BlockSize)
+		for i := uint32(0); i < inodeTableBlocks; i++ {
+			b.writeAt(b.blockOffset(inodeTableBlock+i), zeroBlock)
+		}
 	}
 
 	if DEBUG {
-		fmt.Println("✓ Block and inode bitmaps written")
+		fmt.Println("✓ Block and inode bitmaps written and inode tables initialized")
 	}
 }
 
@@ -845,16 +856,247 @@ func (b *Ext4ImageBuilder) createFileInode(mode, uid, gid uint16, size uint32) *
 
 // initExtentHeader initializes the extent header in an inode
 func (b *Ext4ImageBuilder) initExtentHeader(inode *Ext4Inode) {
+	// CRITICAL: Zero out the entire Block array first to clear any old extent data
+	//           This prevents the kernel from reading garbage extent entries
+	for i := range inode.Block {
+		inode.Block[i] = 0
+	}
+
 	header := Ext4ExtentHeader{
-		Magic:   0xF30A,
-		Entries: 0,
-		Max:     4, // Maximum extents in inode
-		Depth:   0, // Leaf level
+		Magic:      0xF30A,
+		Entries:    0,
+		Max:        4, // Maximum extents in inode
+		Depth:      0, // Leaf level
+		Generation: 0, // Generation counter
 	}
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, header)
 	copy(inode.Block[:], buf.Bytes())
+}
+
+// getInodeBlocks returns all data blocks allocated to an inode by reading its extent tree
+func (b *Ext4ImageBuilder) getInodeBlocks(inodeNum uint32) []uint32 {
+	inode := b.readInode(inodeNum)
+
+	// Read extent header
+	entriesCount := binary.LittleEndian.Uint16(inode.Block[2:4])
+	depth := binary.LittleEndian.Uint16(inode.Block[6:8])
+
+	if entriesCount == 0 {
+		return []uint32{}
+	}
+
+	var blocks []uint32
+
+	if depth == 0 {
+		// Leaf level - read extents directly from inode
+		for i := uint16(0); i < entriesCount; i++ {
+			extentOffset := 12 + i*12 // Header is 12 bytes, each extent is 12 bytes
+			// Ext4Extent structure: Block(4), Len(2), StartHi(2), StartLo(4)
+			length := binary.LittleEndian.Uint16(inode.Block[extentOffset+4:])
+			startLo := binary.LittleEndian.Uint32(inode.Block[extentOffset+8:])
+
+			// Add all blocks from this extent
+			for j := uint16(0); j < length; j++ {
+				blocks = append(blocks, startLo+uint32(j))
+			}
+		}
+	} else if depth == 1 {
+		// Index level - read from leaf blocks
+		for i := uint16(0); i < entriesCount; i++ {
+			idxOffset := 12 + i*12
+			// Ext4ExtentIdx: Block(4), LeafLo(4), LeafHi(2), Unused(2)
+			leafBlockNum := binary.LittleEndian.Uint32(inode.Block[idxOffset+4:])
+
+			// Read leaf block
+			leafData := make([]byte, BlockSize)
+			b.readAt(b.blockOffset(leafBlockNum), leafData)
+
+			leafEntries := binary.LittleEndian.Uint16(leafData[2:4])
+			for j := uint16(0); j < leafEntries; j++ {
+				extentOffset := 12 + j*12
+				length := binary.LittleEndian.Uint16(leafData[extentOffset+4:])
+				startLo := binary.LittleEndian.Uint32(leafData[extentOffset+8:])
+
+				for k := uint16(0); k < length; k++ {
+					blocks = append(blocks, startLo+uint32(k))
+				}
+			}
+		}
+	}
+
+	return blocks
+}
+
+// addBlockToInode adds a new block to an inode's extent tree
+func (b *Ext4ImageBuilder) addBlockToInode(inodeNum, newBlock uint32) {
+	inode := b.readInode(inodeNum)
+
+	// Read extent header
+	entriesCount := binary.LittleEndian.Uint16(inode.Block[2:4])
+	maxEntries := binary.LittleEndian.Uint16(inode.Block[4:6])
+	depth := binary.LittleEndian.Uint16(inode.Block[6:8])
+
+	if entriesCount == 0 {
+		// No extents yet, create the first one
+		binary.LittleEndian.PutUint16(inode.Block[2:4], 1) // entries = 1
+
+		// Write extent at offset 12
+		// Ext4Extent: Block(4), Len(2), StartHi(2), StartLo(4)
+		binary.LittleEndian.PutUint32(inode.Block[12:], 0)        // block = 0
+		binary.LittleEndian.PutUint16(inode.Block[16:], 1)        // len = 1
+		binary.LittleEndian.PutUint16(inode.Block[18:], 0)        // start_hi = 0
+		binary.LittleEndian.PutUint32(inode.Block[20:], newBlock) // start_lo = newBlock
+
+		b.writeInode(inodeNum, inode)
+		return
+	}
+
+	if depth == 0 {
+		// Leaf level - try to extend the last extent if the new block is contiguous
+		lastExtentOffset := 12 + (entriesCount-1)*12
+		lastLogicalBlock := binary.LittleEndian.Uint32(inode.Block[lastExtentOffset:])
+		lastLen := binary.LittleEndian.Uint16(inode.Block[lastExtentOffset+4:])
+		lastStartLo := binary.LittleEndian.Uint32(inode.Block[lastExtentOffset+8:])
+
+		// Check if we can extend the last extent
+		if lastStartLo+uint32(lastLen) == newBlock && lastLen < 32768 {
+			// Extend the last extent
+			binary.LittleEndian.PutUint16(inode.Block[lastExtentOffset+4:], lastLen+1)
+			b.writeInode(inodeNum, inode)
+			return
+		}
+
+		// Need to add a new extent
+		if entriesCount >= maxEntries {
+			// Convert to depth-1 tree
+			b.convertToIndexedExtents(inodeNum, newBlock)
+			return
+		}
+
+		// Add new extent
+		newExtentOffset := 12 + entriesCount*12
+		binary.LittleEndian.PutUint32(inode.Block[newExtentOffset:], lastLogicalBlock+uint32(lastLen)) // next logical block
+		binary.LittleEndian.PutUint16(inode.Block[newExtentOffset+4:], 1)                              // len = 1
+		binary.LittleEndian.PutUint16(inode.Block[newExtentOffset+6:], 0)                              // start_hi = 0
+		binary.LittleEndian.PutUint32(inode.Block[newExtentOffset+8:], newBlock)                       // start_lo = newBlock
+
+		// Update entries count
+		binary.LittleEndian.PutUint16(inode.Block[2:4], entriesCount+1)
+
+		b.writeInode(inodeNum, inode)
+	} else {
+		// Index level - add to the appropriate leaf block
+		b.addBlockToIndexedExtents(inodeNum, newBlock)
+	}
+}
+
+// convertToIndexedExtents converts a flat extent tree to a depth-1 tree with index nodes
+func (b *Ext4ImageBuilder) convertToIndexedExtents(inodeNum, newBlock uint32) {
+	inode := b.readInode(inodeNum)
+
+	// Read current extents
+	entriesCount := binary.LittleEndian.Uint16(inode.Block[2:4])
+
+	// Allocate a new block for the leaf extents
+	leafBlock := b.allocateBlock()
+
+	// Prepare leaf block with extent header
+	leafData := make([]byte, BlockSize)
+	binary.LittleEndian.PutUint16(leafData[0:], 0xF30A)            // magic
+	binary.LittleEndian.PutUint16(leafData[2:], entriesCount+1)    // entries (existing + new)
+	binary.LittleEndian.PutUint16(leafData[4:], (BlockSize-12)/12) // max entries in a block
+	binary.LittleEndian.PutUint16(leafData[6:], 0)                 // depth = 0 (leaf)
+	binary.LittleEndian.PutUint32(leafData[8:], 0)                 // generation = 0
+
+	// Copy existing extents to leaf block
+	copy(leafData[12:], inode.Block[12:12+entriesCount*12])
+
+	// Add the new extent to leaf block
+	lastExtentOffset := 12 + (entriesCount-1)*12
+	lastLogicalBlock := binary.LittleEndian.Uint32(leafData[lastExtentOffset:])
+	lastLen := binary.LittleEndian.Uint16(leafData[lastExtentOffset+4:])
+
+	newExtentOffset := 12 + entriesCount*12
+	binary.LittleEndian.PutUint32(leafData[newExtentOffset:], lastLogicalBlock+uint32(lastLen)) // next logical block
+	binary.LittleEndian.PutUint16(leafData[newExtentOffset+4:], 1)                              // len = 1
+	binary.LittleEndian.PutUint16(leafData[newExtentOffset+6:], 0)                              // start_hi = 0
+	binary.LittleEndian.PutUint32(leafData[newExtentOffset+8:], newBlock)                       // start_lo = newBlock
+
+	// Write leaf block
+	b.writeAt(b.blockOffset(leafBlock), leafData)
+
+	// Update inode to be an index node - completely rewrite the extent header
+	// Clear the old extent data first
+	for i := 0; i < 60; i++ {
+		inode.Block[i] = 0
+	}
+
+	// Write extent header for index node
+	binary.LittleEndian.PutUint16(inode.Block[0:], 0xF30A) // magic
+	binary.LittleEndian.PutUint16(inode.Block[2:], 1)      // entries = 1 (one index)
+	binary.LittleEndian.PutUint16(inode.Block[4:], 4)      // max = 4 (max indices in inode)
+	binary.LittleEndian.PutUint16(inode.Block[6:], 1)      // depth = 1 (index level)
+	binary.LittleEndian.PutUint32(inode.Block[8:], 0)      // generation = 0
+
+	// Write index entry at offset 12
+	// Ext4ExtentIdx: Block(4), LeafLo(4), LeafHi(2), Unused(2)
+	binary.LittleEndian.PutUint32(inode.Block[12:], 0)         // block = 0 (first logical block)
+	binary.LittleEndian.PutUint32(inode.Block[16:], leafBlock) // leaf_lo
+	binary.LittleEndian.PutUint16(inode.Block[20:], 0)         // leaf_hi
+	binary.LittleEndian.PutUint16(inode.Block[22:], 0)         // unused
+
+	// CRITICAL FIX: Update BlocksLo to account for the metadata block (leaf extent block)
+	// i_blocks counts 512-byte sectors, including metadata blocks
+	inode.BlocksLo += BlockSize / 512
+
+	b.writeInode(inodeNum, inode)
+}
+
+// addBlockToIndexedExtents adds a block to an indexed (depth-1) extent tree
+func (b *Ext4ImageBuilder) addBlockToIndexedExtents(inodeNum, newBlock uint32) {
+	inode := b.readInode(inodeNum)
+
+	// For simplicity, we only support single index node (depth-1)
+	// Read the leaf block from the index
+	leafBlockNum := binary.LittleEndian.Uint32(inode.Block[16:])
+
+	// Read leaf block
+	leafData := make([]byte, BlockSize)
+	b.readAt(b.blockOffset(leafBlockNum), leafData)
+
+	entriesCount := binary.LittleEndian.Uint16(leafData[2:4])
+	maxEntries := binary.LittleEndian.Uint16(leafData[4:6])
+
+	// Try to extend the last extent
+	lastExtentOffset := 12 + (entriesCount-1)*12
+	lastLogicalBlock := binary.LittleEndian.Uint32(leafData[lastExtentOffset:])
+	lastLen := binary.LittleEndian.Uint16(leafData[lastExtentOffset+4:])
+	lastStartLo := binary.LittleEndian.Uint32(leafData[lastExtentOffset+8:])
+
+	if lastStartLo+uint32(lastLen) == newBlock && lastLen < 32768 {
+		// Extend the last extent
+		binary.LittleEndian.PutUint16(leafData[lastExtentOffset+4:], lastLen+1)
+		b.writeAt(b.blockOffset(leafBlockNum), leafData)
+		return
+	}
+
+	// Add new extent
+	if entriesCount >= maxEntries {
+		panic(fmt.Sprintf("inode %d leaf extent block is full (max=%d entries)", inodeNum, maxEntries))
+	}
+
+	newExtentOffset := 12 + entriesCount*12
+	binary.LittleEndian.PutUint32(leafData[newExtentOffset:], lastLogicalBlock+uint32(lastLen)) // next logical block
+	binary.LittleEndian.PutUint16(leafData[newExtentOffset+4:], 1)                              // len = 1
+	binary.LittleEndian.PutUint16(leafData[newExtentOffset+6:], 0)                              // start_hi = 0
+	binary.LittleEndian.PutUint32(leafData[newExtentOffset+8:], newBlock)                       // start_lo = newBlock
+
+	// Update entries count
+	binary.LittleEndian.PutUint16(leafData[2:4], entriesCount+1)
+
+	b.writeAt(b.blockOffset(leafBlockNum), leafData)
 }
 
 // setInodeBlock sets the data block for an inode using extents
@@ -1171,73 +1413,96 @@ func (b *Ext4ImageBuilder) freeBlock(blockNum uint32) {
 
 // addDirEntry adds a new entry to a directory
 func (b *Ext4ImageBuilder) addDirEntry(dirInodeNum uint32, newEntry Ext4DirEntry2) {
-	// Read directory inode to get data block
-	dirInode := b.readInode(dirInodeNum)
+	// Get all blocks allocated to this directory
+	dirBlocks := b.getInodeBlocks(dirInodeNum)
 
-	// Get the data block from extent
-	dataBlock := binary.LittleEndian.Uint32(dirInode.Block[20:24]) // extent start_lo
-
-	// Read existing entries into memory
-	offset := b.blockOffset(dataBlock)
-	block := make([]byte, BlockSize)
-	b.readAt(offset, block)
-
-	// Find the last entry and shrink it
-	currentOffset := 0
-	lastEntryOffset := 0
-	var lastRecLen uint16
-
-	for currentOffset < BlockSize {
-		recLen := binary.LittleEndian.Uint16(block[currentOffset+4:])
-		if recLen == 0 {
-			break
-		}
-
-		lastEntryOffset = currentOffset
-		lastRecLen = recLen
-		currentOffset += int(recLen)
-
-		if currentOffset >= BlockSize {
-			break
-		}
+	if len(dirBlocks) == 0 {
+		panic(fmt.Sprintf("directory inode %d has no allocated blocks", dirInodeNum))
 	}
 
-	// Calculate actual size of last entry
-	lastNameLen := block[lastEntryOffset+6]
-	lastActualSize := uint16(8 + lastNameLen)
-	if lastActualSize%4 != 0 {
-		lastActualSize += 4 - (lastActualSize % 4)
-	}
-
-	// Calculate new entry size
+	// Calculate new entry size (aligned to 4 bytes)
 	newNameLen := uint8(len(newEntry.Name))
 	newRecLen := uint16(8 + newNameLen)
 	if newRecLen%4 != 0 {
 		newRecLen += 4 - (newRecLen % 4)
 	}
 
-	// Check if there's room
-	spaceAvailable := lastRecLen - lastActualSize
-	if spaceAvailable >= newRecLen {
-		// Shrink last entry
-		binary.LittleEndian.PutUint16(block[lastEntryOffset+4:], lastActualSize)
+	// Try to add to existing blocks
+	for _, dataBlock := range dirBlocks {
+		offset := b.blockOffset(dataBlock)
+		block := make([]byte, BlockSize)
+		b.readAt(offset, block)
 
-		// Write new entry
-		newOffset := lastEntryOffset + int(lastActualSize)
-		remainingSpace := BlockSize - newOffset
+		// Find the last entry in this block
+		currentOffset := 0
+		lastEntryOffset := 0
+		var lastRecLen uint16
 
-		binary.LittleEndian.PutUint32(block[newOffset:], newEntry.Inode)
-		binary.LittleEndian.PutUint16(block[newOffset+4:], uint16(remainingSpace))
-		block[newOffset+6] = newNameLen
-		block[newOffset+7] = newEntry.FileType
-		copy(block[newOffset+8:], newEntry.Name)
+		for currentOffset < BlockSize {
+			recLen := binary.LittleEndian.Uint16(block[currentOffset+4:])
+			if recLen == 0 {
+				break
+			}
 
-		// Persist updated directory block.
-		b.writeAt(offset, block)
-		return
+			lastEntryOffset = currentOffset
+			lastRecLen = recLen
+			currentOffset += int(recLen)
+
+			if currentOffset >= BlockSize {
+				break
+			}
+		}
+
+		// Calculate actual size of last entry
+		lastNameLen := block[lastEntryOffset+6]
+		lastActualSize := uint16(8 + lastNameLen)
+		if lastActualSize%4 != 0 {
+			lastActualSize += 4 - (lastActualSize % 4)
+		}
+
+		// Check if there's room in this block
+		spaceAvailable := lastRecLen - lastActualSize
+		if spaceAvailable >= newRecLen {
+			// Shrink last entry
+			binary.LittleEndian.PutUint16(block[lastEntryOffset+4:], lastActualSize)
+
+			// Write new entry
+			newOffset := lastEntryOffset + int(lastActualSize)
+			remainingSpace := BlockSize - newOffset
+
+			binary.LittleEndian.PutUint32(block[newOffset:], newEntry.Inode)
+			binary.LittleEndian.PutUint16(block[newOffset+4:], uint16(remainingSpace))
+			block[newOffset+6] = newNameLen
+			block[newOffset+7] = newEntry.FileType
+			copy(block[newOffset+8:], newEntry.Name)
+
+			// Persist updated directory block
+			b.writeAt(offset, block)
+			return
+		}
 	}
 
-	// For now, fail fast if a directory overflows its single block.
-	// This avoids silently creating an inconsistent filesystem image.
-	panic(fmt.Sprintf("directory inode %d is full; multi-block directories are not yet supported", dirInodeNum))
+	// No space in existing blocks, allocate a new block
+	newBlock := b.allocateBlock()
+	b.addBlockToInode(dirInodeNum, newBlock)
+
+	// Create new block with the entry
+	block := make([]byte, BlockSize)
+
+	// Write the new entry as the only entry in this block
+	binary.LittleEndian.PutUint32(block[0:], newEntry.Inode)
+	binary.LittleEndian.PutUint16(block[4:], uint16(BlockSize)) // Takes entire block
+	block[6] = newNameLen
+	block[7] = newEntry.FileType
+	copy(block[8:], newEntry.Name)
+
+	// Write the new block
+	offset := b.blockOffset(newBlock)
+	b.writeAt(offset, block)
+
+	// Update directory inode size and block count
+	dirInode := b.readInode(dirInodeNum)
+	dirInode.SizeLo += BlockSize
+	dirInode.BlocksLo += BlockSize / 512 // BlocksLo is in 512-byte sectors
+	b.writeInode(dirInodeNum, dirInode)
 }

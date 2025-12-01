@@ -314,6 +314,14 @@ type Ext4Extent struct {
 	StartLo uint32 // Low 32 bits of physical block
 }
 
+// Ext4ExtentIdx represents an extent index (for non-leaf nodes)
+type Ext4ExtentIdx struct {
+	Block  uint32 // First logical block covered by this index
+	LeafLo uint32 // Low 32 bits of physical block of extent leaf
+	LeafHi uint16 // High 16 bits of physical block
+	Unused uint16 // Reserved (must be zero)
+}
+
 // Ext4DirEntry2 represents a directory entry (version 2)
 type Ext4DirEntry2 struct {
 	Inode    uint32 // Inode number

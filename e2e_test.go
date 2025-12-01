@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	ext4 "github.com/pilat/go-ext4fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -886,6 +887,141 @@ func TestSpecialFileNames(t *testing.T) {
 	}
 }
 
+// TestMultiBlockDirectory tests that directories can span multiple blocks
+// This is important for directories with many entries
+func TestMultiBlockDirectory(t *testing.T) {
+	skipIfNoDocker(t)
+
+	tc := newTestContext(t, 128) // Use larger image for this test
+	tc.builder.PrepareFilesystem()
+
+	// Create a directory that will need multiple blocks
+	// Each directory entry takes roughly 12-24 bytes (depends on name length)
+	// A 4KB block can hold approximately 170-340 entries
+	// We'll create 400 files to ensure we need at least 2 blocks
+	testDir := tc.builder.CreateDirectory(ext4.RootInode, "many_files", 0755, 0, 0)
+
+	numFiles := 400
+	for i := 0; i < numFiles; i++ {
+		fileName := fmt.Sprintf("file_%03d.txt", i)
+		content := fmt.Sprintf("This is file number %d\n", i)
+		tc.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+	}
+
+	tc.finalize()
+
+	// Verify the directory exists and has all files
+	output := tc.dockerExecSimple(
+		`cd many_files`,
+		`ls -1 | wc -l`, // Count files
+		`test -f file_000.txt && echo "first file exists"`,
+		`test -f file_199.txt && echo "middle file exists"`,
+		`test -f file_399.txt && echo "last file exists"`,
+		`cat file_000.txt`,
+		`cat file_399.txt`,
+	)
+
+	assert.Contains(t, output, "400") // Should have 400 files
+	assert.Contains(t, output, "first file exists")
+	assert.Contains(t, output, "middle file exists")
+	assert.Contains(t, output, "last file exists")
+	assert.Contains(t, output, "This is file number 0")
+	assert.Contains(t, output, "This is file number 399")
+}
+
+// TestMultiBlockDirectoryWithSymlinks tests multi-block directories with various entry types
+func TestMultiBlockDirectoryWithSymlinks(t *testing.T) {
+	skipIfNoDocker(t)
+
+	tc := newTestContext(t, 128)
+	tc.builder.PrepareFilesystem()
+
+	// Create a directory with mixed content types
+	testDir := tc.builder.CreateDirectory(ext4.RootInode, "mixed_dir", 0755, 0, 0)
+
+	// Add 100 regular files
+	for i := 0; i < 100; i++ {
+		fileName := fmt.Sprintf("regular_%03d.txt", i)
+		tc.builder.CreateFile(testDir, fileName, []byte("regular file"), 0644, 0, 0)
+	}
+
+	// Add 100 subdirectories
+	for i := 0; i < 100; i++ {
+		dirName := fmt.Sprintf("subdir_%03d", i)
+		tc.builder.CreateDirectory(testDir, dirName, 0755, 0, 0)
+	}
+
+	// Add 100 symlinks
+	for i := 0; i < 100; i++ {
+		linkName := fmt.Sprintf("link_%03d", i)
+		target := fmt.Sprintf("regular_%03d.txt", i)
+		tc.builder.CreateSymlink(testDir, linkName, target, 0, 0)
+	}
+
+	tc.finalize()
+
+	// Verify all entries exist
+	output := tc.dockerExecSimple(
+		`cd mixed_dir`,
+		`ls -1 | wc -l`, // Count total entries
+		`ls -1 regular_* | wc -l`,
+		`ls -1d subdir_* | wc -l`,
+		`ls -1 link_* | wc -l`,
+		`test -f regular_000.txt && echo "regular file exists"`,
+		`test -d subdir_050 && echo "subdir exists"`,
+		`test -L link_099 && echo "symlink exists"`,
+		`readlink link_050`,
+	)
+
+	assert.Contains(t, output, "300") // Total entries
+	assert.Contains(t, output, "100") // Regular files, subdirs, and symlinks each
+	assert.Contains(t, output, "regular file exists")
+	assert.Contains(t, output, "subdir exists")
+	assert.Contains(t, output, "symlink exists")
+	assert.Contains(t, output, "regular_050.txt") // Symlink target
+}
+
+// TestMultiBlockDirectoryNested tests nested directories with many entries
+func TestMultiBlockDirectoryNested(t *testing.T) {
+	skipIfNoDocker(t)
+
+	tc := newTestContext(t, 128)
+	tc.builder.PrepareFilesystem()
+
+	// Create nested structure with many files at each level
+	level1 := tc.builder.CreateDirectory(ext4.RootInode, "level1", 0755, 0, 0)
+
+	// Add many files to level1
+	for i := 0; i < 200; i++ {
+		fileName := fmt.Sprintf("l1_file_%03d.txt", i)
+		tc.builder.CreateFile(level1, fileName, []byte("level 1 content"), 0644, 0, 0)
+	}
+
+	level2 := tc.builder.CreateDirectory(level1, "level2", 0755, 0, 0)
+
+	// Add many files to level2
+	for i := 0; i < 200; i++ {
+		fileName := fmt.Sprintf("l2_file_%03d.txt", i)
+		tc.builder.CreateFile(level2, fileName, []byte("level 2 content"), 0644, 0, 0)
+	}
+
+	tc.finalize()
+
+	// Verify nested structure
+	output := tc.dockerExecSimple(
+		`cd level1`,
+		`ls -1 l1_file_* | wc -l`,
+		`test -d level2 && echo "level2 exists"`,
+		`cd level2`,
+		`ls -1 l2_file_* | wc -l`,
+		`cat l2_file_000.txt`,
+	)
+
+	assert.Contains(t, output, "200")
+	assert.Contains(t, output, "level2 exists")
+	assert.Contains(t, output, "level 2 content")
+}
+
 // BenchmarkFilesystemCreation benchmarks the image creation process
 func BenchmarkFilesystemCreation(b *testing.B) {
 	for i := 0; i < b.N; i++ {
@@ -920,4 +1056,46 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 
 		os.Remove(imagePath)
 	}
+}
+
+// TestExtentTreeConversion tests the conversion from flat to indexed extent trees
+func TestExtentTreeConversion(t *testing.T) {
+	skipIfNoDocker(t)
+
+	tc := newTestContext(t, 128)
+	tc.builder.PrepareFilesystem()
+
+	// Create a directory and add files until we trigger extent tree conversion
+	// Each file creates a directory entry, and when entries fill the first block,
+	// a new block is allocated. When we have >4 non-contiguous extent ranges,
+	// the extent tree must convert from flat to indexed.
+
+	testDir := tc.builder.CreateDirectory(ext4.RootInode, "extent_test", 0755, 0, 0)
+
+	// Create many files to force multiple blocks and potential non-contiguous allocation
+	for i := 0; i < 500; i++ {
+		fileName := fmt.Sprintf("file_%04d.txt", i)
+		content := fmt.Sprintf("Content %d\n", i)
+		tc.builder.CreateFile(testDir, fileName, []byte(content), 0644, 0, 0)
+	}
+
+	tc.finalize()
+
+	// Verify all files exist and are readable
+	output := tc.dockerExecSimple(
+		`cd extent_test`,
+		`ls -1 | wc -l`,
+		`test -f file_0000.txt && echo "first exists"`,
+		`test -f file_0250.txt && echo "middle exists"`,
+		`test -f file_0499.txt && echo "last exists"`,
+		`cat file_0000.txt`,
+		`cat file_0499.txt`,
+	)
+
+	assert.Contains(t, output, "500")
+	assert.Contains(t, output, "first exists")
+	assert.Contains(t, output, "middle exists")
+	assert.Contains(t, output, "last exists")
+	assert.Contains(t, output, "Content 0")
+	assert.Contains(t, output, "Content 499")
 }
