@@ -94,6 +94,26 @@ func (e *Ext4ImageBuilder) CreateSymlink(parent uint32, name, target string, uid
 	return e.builder.CreateSymlink(parent, name, target, uid, gid)
 }
 
+// SetXattr sets an extended attribute on an inode
+func (e *Ext4ImageBuilder) SetXattr(inodeNum uint32, name string, value []byte) error {
+	return e.builder.SetXattr(inodeNum, name, value)
+}
+
+// GetXattr retrieves an extended attribute from an inode
+func (e *Ext4ImageBuilder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
+	return e.builder.GetXattr(inodeNum, name)
+}
+
+// ListXattrs returns all extended attribute names for an inode
+func (e *Ext4ImageBuilder) ListXattrs(inodeNum uint32) ([]string, error) {
+	return e.builder.ListXattrs(inodeNum)
+}
+
+// RemoveXattr removes an extended attribute from an inode
+func (e *Ext4ImageBuilder) RemoveXattr(inodeNum uint32, name string) error {
+	return e.builder.RemoveXattr(inodeNum, name)
+}
+
 // FinalizeMetadata updates counters
 func (e *Ext4ImageBuilder) FinalizeMetadata() {
 	e.builder.FinalizeMetadata()

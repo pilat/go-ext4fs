@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 var DEBUG = false
@@ -246,6 +247,152 @@ func (b *Builder) CreateSymlink(parentInode uint32, name, target string, uid, gi
 	return inodeNum, nil
 }
 
+// SetXattr sets an extended attribute on an inode
+func (b *Builder) SetXattr(inodeNum uint32, name string, value []byte) error {
+	if len(name) == 0 {
+		return fmt.Errorf("xattr name cannot be empty")
+	}
+
+	nameIndex, shortName, err := parseXattrName(name)
+	if err != nil {
+		return err
+	}
+
+	if len(shortName) > 255 {
+		return fmt.Errorf("xattr name too long: %d > 255", len(shortName))
+	}
+
+	inode := b.readInode(inodeNum)
+
+	var xattrBlock uint32
+	var entries []XattrEntry
+
+	if inode.FileACLLo != 0 {
+		xattrBlock = inode.FileACLLo
+		entries = b.readXattrBlock(xattrBlock)
+	} else {
+		var err error
+		xattrBlock, err = b.allocateBlock()
+		if err != nil {
+			return err
+		}
+		inode.FileACLLo = xattrBlock
+		inode.BlocksLo += BlockSize / 512
+	}
+
+	// Update existing or add new entry
+	found := false
+	for i, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			entries[i].Value = value
+			found = true
+			break
+		}
+	}
+	if !found {
+		entries = append(entries, XattrEntry{
+			NameIndex: nameIndex,
+			Name:      shortName,
+			Value:     value,
+		})
+	}
+
+	if err := b.writeXattrBlock(xattrBlock, entries); err != nil {
+		return err
+	}
+
+	b.writeInode(inodeNum, inode)
+
+	if DEBUG {
+		fmt.Printf("✓ Set xattr %s on inode %d (%d bytes)\n", name, inodeNum, len(value))
+	}
+
+	return nil
+}
+
+// GetXattr retrieves an extended attribute from an inode (for testing)
+func (b *Builder) GetXattr(inodeNum uint32, name string) ([]byte, error) {
+	nameIndex, shortName, err := parseXattrName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	inode := b.readInode(inodeNum)
+	if inode.FileACLLo == 0 {
+		return nil, fmt.Errorf("no xattrs on inode %d", inodeNum)
+	}
+
+	entries := b.readXattrBlock(inode.FileACLLo)
+	for _, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			return e.Value, nil
+		}
+	}
+
+	return nil, fmt.Errorf("xattr %s not found", name)
+}
+
+// ListXattrs returns all extended attribute names for an inode
+func (b *Builder) ListXattrs(inodeNum uint32) ([]string, error) {
+	inode := b.readInode(inodeNum)
+	if inode.FileACLLo == 0 {
+		return nil, nil
+	}
+
+	entries := b.readXattrBlock(inode.FileACLLo)
+	names := make([]string, 0, len(entries))
+
+	for _, e := range entries {
+		prefix := xattrIndexToPrefix(e.NameIndex)
+		names = append(names, prefix+e.Name)
+	}
+
+	return names, nil
+}
+
+// RemoveXattr removes an extended attribute from an inode
+func (b *Builder) RemoveXattr(inodeNum uint32, name string) error {
+	nameIndex, shortName, err := parseXattrName(name)
+	if err != nil {
+		return err
+	}
+
+	inode := b.readInode(inodeNum)
+	if inode.FileACLLo == 0 {
+		return fmt.Errorf("no xattrs on inode %d", inodeNum)
+	}
+
+	entries := b.readXattrBlock(inode.FileACLLo)
+	newEntries := make([]XattrEntry, 0, len(entries))
+	found := false
+
+	for _, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			found = true
+			continue
+		}
+		newEntries = append(newEntries, e)
+	}
+
+	if !found {
+		return fmt.Errorf("xattr %s not found", name)
+	}
+
+	if len(newEntries) == 0 {
+		// Free the xattr block
+		b.freeBlock(inode.FileACLLo)
+		inode.FileACLLo = 0
+		inode.BlocksLo -= BlockSize / 512
+	} else {
+		if err := b.writeXattrBlock(inode.FileACLLo, newEntries); err != nil {
+			return err
+		}
+	}
+
+	b.writeInode(inodeNum, inode)
+	return nil
+}
+
 func (b *Builder) FinalizeMetadata() {
 	// Calculate per-group statistics
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
@@ -296,8 +443,8 @@ func (b *Builder) FinalizeMetadata() {
 		binary.LittleEndian.PutUint16(gdBuf[14:16], freeInodes)
 		// UsedDirsCount for THIS group
 		binary.LittleEndian.PutUint16(gdBuf[16:18], b.usedDirsPerGroup[g])
-		// Flags at offset 18 - keep BGInodeZeroed
-		binary.LittleEndian.PutUint16(gdBuf[18:20], BGInodeZeroed)
+		// Flags at offset 18 - don't set BGInodeZeroed without metadata_csum
+		binary.LittleEndian.PutUint16(gdBuf[18:20], 0)
 		// ItableUnusedLo at offset 28
 		binary.LittleEndian.PutUint16(gdBuf[28:30], itableUnused)
 
@@ -470,8 +617,8 @@ func (b *Builder) writeGroupDescriptors() {
 			FreeBlocksCountLo: uint16(freeBlocks),
 			FreeInodesCountLo: freeInodes,
 			UsedDirsCountLo:   0,
-			Flags:             BGInodeZeroed, // Mark as zeroed since we zero inode tables
-			ItableUnusedLo:    freeInodes,    // Will be updated in FinalizeMetadata
+			Flags:             0, // Don't set BGInodeZeroed without metadata_csum
+			ItableUnusedLo:    freeInodes,
 		}
 
 		var buf bytes.Buffer
@@ -634,70 +781,6 @@ func (b *Builder) freeBlock(blockNum uint32) {
 	// Track freed blocks for accurate count and reuse
 	b.freedBlocksPerGroup[group]++
 	b.freeBlockList = append(b.freeBlockList, blockNum)
-}
-
-// Replace the existing overwriteFile function
-func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
-	// Read existing inode to get its blocks
-	oldInode := b.readInode(inodeNum)
-
-	// Free the old blocks
-	oldBlocks := b.getInodeBlocks(oldInode)
-	for _, blk := range oldBlocks {
-		b.freeBlock(blk)
-	}
-
-	// If the old inode had an extent tree (depth > 0), free the index blocks too
-	if (oldInode.Flags & InodeFlagExtents) != 0 {
-		depth := binary.LittleEndian.Uint16(oldInode.Block[6:8])
-		if depth > 0 {
-			entries := binary.LittleEndian.Uint16(oldInode.Block[2:4])
-			for i := uint16(0); i < entries && i < 4; i++ {
-				off := 12 + i*12
-				leafBlock := binary.LittleEndian.Uint32(oldInode.Block[off+4:])
-				b.freeBlock(leafBlock)
-			}
-		}
-	}
-
-	size := uint64(len(content))
-	blocksNeeded := uint32((size + BlockSize - 1) / BlockSize)
-	if blocksNeeded == 0 {
-		blocksNeeded = 1
-	}
-
-	inode := b.makeFileInode(mode, uid, gid, size)
-
-	blocks, err := b.allocateBlocks(blocksNeeded)
-	if err != nil {
-		return 0, err
-	}
-
-	if blocksNeeded == 1 {
-		b.setExtent(&inode, 0, blocks[0], 1)
-	} else {
-		if err := b.setExtentMultiple(&inode, blocks); err != nil {
-			return 0, err
-		}
-	}
-	inode.BlocksLo = blocksNeeded * (BlockSize / 512)
-
-	for i, blk := range blocks {
-		block := make([]byte, BlockSize)
-		start := uint64(i) * BlockSize
-		end := start + BlockSize
-		if end > size {
-			end = size
-		}
-		if start < size {
-			copy(block, content[start:end])
-		}
-		b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk)))
-	}
-
-	b.writeInode(inodeNum, &inode)
-
-	return inodeNum, nil
 }
 
 // ============================================================================
@@ -1341,4 +1424,289 @@ func (b *Builder) findEntry(dirInode uint32, name string) uint32 {
 	}
 
 	return 0
+}
+
+func parseXattrName(name string) (uint8, string, error) {
+	prefixes := []struct {
+		prefix string
+		index  uint8
+	}{
+		{"user.", XattrIndexUser},
+		{"security.", XattrIndexSecurity},
+		{"trusted.", XattrIndexTrusted},
+		{"system.posix_acl_access", XattrIndexPosixACLAccess},
+		{"system.posix_acl_default", XattrIndexPosixACLDefault},
+		{"system.", XattrIndexSystem},
+	}
+
+	for _, p := range prefixes {
+		if strings.HasPrefix(name, p.prefix) {
+			shortName := strings.TrimPrefix(name, p.prefix)
+			// Special case for POSIX ACLs - name is empty
+			if p.index == XattrIndexPosixACLAccess || p.index == XattrIndexPosixACLDefault {
+				shortName = ""
+			}
+			return p.index, shortName, nil
+		}
+	}
+
+	return 0, "", fmt.Errorf("unknown xattr namespace in: %s", name)
+}
+
+func xattrIndexToPrefix(index uint8) string {
+	switch index {
+	case XattrIndexUser:
+		return "user."
+	case XattrIndexSecurity:
+		return "security."
+	case XattrIndexTrusted:
+		return "trusted."
+	case XattrIndexPosixACLAccess:
+		return "system.posix_acl_access"
+	case XattrIndexPosixACLDefault:
+		return "system.posix_acl_default"
+	case XattrIndexSystem:
+		return "system."
+	default:
+		return fmt.Sprintf("unknown(%d).", index)
+	}
+}
+
+func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
+	// Read existing inode to get its blocks
+	oldInode := b.readInode(inodeNum)
+
+	// Free the xattr block if present
+	if oldInode.FileACLLo != 0 {
+		b.freeBlock(oldInode.FileACLLo)
+	}
+
+	// Free the old blocks
+	oldBlocks := b.getInodeBlocks(oldInode)
+	for _, blk := range oldBlocks {
+		b.freeBlock(blk)
+	}
+
+	// If the old inode had an extent tree (depth > 0), free the index blocks too
+	if (oldInode.Flags & InodeFlagExtents) != 0 {
+		depth := binary.LittleEndian.Uint16(oldInode.Block[6:8])
+		if depth > 0 {
+			entries := binary.LittleEndian.Uint16(oldInode.Block[2:4])
+			for i := uint16(0); i < entries && i < 4; i++ {
+				off := 12 + i*12
+				leafBlock := binary.LittleEndian.Uint32(oldInode.Block[off+4:])
+				b.freeBlock(leafBlock)
+			}
+		}
+	}
+
+	size := uint64(len(content))
+	blocksNeeded := uint32((size + BlockSize - 1) / BlockSize)
+	if blocksNeeded == 0 {
+		blocksNeeded = 1
+	}
+
+	inode := b.makeFileInode(mode, uid, gid, size)
+
+	blocks, err := b.allocateBlocks(blocksNeeded)
+	if err != nil {
+		return 0, err
+	}
+
+	if blocksNeeded == 1 {
+		b.setExtent(&inode, 0, blocks[0], 1)
+	} else {
+		if err := b.setExtentMultiple(&inode, blocks); err != nil {
+			return 0, err
+		}
+	}
+	inode.BlocksLo = blocksNeeded * (BlockSize / 512)
+
+	for i, blk := range blocks {
+		block := make([]byte, BlockSize)
+		start := uint64(i) * BlockSize
+		end := start + BlockSize
+		if end > size {
+			end = size
+		}
+		if start < size {
+			copy(block, content[start:end])
+		}
+		b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk)))
+	}
+
+	b.writeInode(inodeNum, &inode)
+
+	return inodeNum, nil
+}
+
+func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
+	block := make([]byte, BlockSize)
+
+	entriesOffset := XattrHeaderSize
+	valuesEnd := BlockSize
+
+	// Sort entries for consistent ordering (by index, then name)
+	sortedEntries := make([]XattrEntry, len(entries))
+	copy(sortedEntries, entries)
+	for i := 0; i < len(sortedEntries)-1; i++ {
+		for j := i + 1; j < len(sortedEntries); j++ {
+			if sortedEntries[i].NameIndex > sortedEntries[j].NameIndex ||
+				(sortedEntries[i].NameIndex == sortedEntries[j].NameIndex &&
+					sortedEntries[i].Name > sortedEntries[j].Name) {
+				sortedEntries[i], sortedEntries[j] = sortedEntries[j], sortedEntries[i]
+			}
+		}
+	}
+
+	// Collect entry hashes for block hash calculation
+	entryHashes := make([]uint32, 0, len(sortedEntries))
+
+	for _, entry := range sortedEntries {
+		nameLen := len(entry.Name)
+		entrySize := XattrEntryHeaderSize + nameLen
+		if entrySize%4 != 0 {
+			entrySize += 4 - (entrySize % 4)
+		}
+
+		valueSize := len(entry.Value)
+		valueSizeAligned := valueSize
+		if valueSizeAligned%4 != 0 {
+			valueSizeAligned += 4 - (valueSizeAligned % 4)
+		}
+
+		// Check space: entries grow up, values grow down
+		if entriesOffset+entrySize > valuesEnd-valueSizeAligned {
+			return fmt.Errorf("xattr block full: cannot fit %s", entry.Name)
+		}
+
+		// Write value at end of block (growing downward)
+		valuesEnd -= valueSizeAligned
+		copy(block[valuesEnd:], entry.Value)
+
+		// Calculate entry hash
+		entryHash := xattrEntryHash(entry.NameIndex, entry.Name, entry.Value)
+		entryHashes = append(entryHashes, entryHash)
+
+		// Write entry header
+		block[entriesOffset] = uint8(nameLen)
+		block[entriesOffset+1] = entry.NameIndex
+		binary.LittleEndian.PutUint16(block[entriesOffset+2:], uint16(valuesEnd))
+		binary.LittleEndian.PutUint32(block[entriesOffset+4:], 0) // value_inum (unused)
+		binary.LittleEndian.PutUint32(block[entriesOffset+8:], uint32(valueSize))
+		binary.LittleEndian.PutUint32(block[entriesOffset+12:], entryHash)
+
+		// Write name
+		copy(block[entriesOffset+XattrEntryHeaderSize:], entry.Name)
+
+		entriesOffset += entrySize
+	}
+
+	// Calculate block hash
+	blockHash := xattrBlockHash(entryHashes)
+
+	// Write header
+	binary.LittleEndian.PutUint32(block[0:4], XattrMagic)
+	binary.LittleEndian.PutUint32(block[4:8], 1)           // refcount
+	binary.LittleEndian.PutUint32(block[8:12], 1)          // blocks
+	binary.LittleEndian.PutUint32(block[12:16], blockHash) // hash
+	// checksum at 16:20, reserved at 20:32 - leave as zero
+
+	b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum)))
+	return nil
+}
+
+func (b *Builder) readXattrBlock(blockNum uint32) []XattrEntry {
+	block := make([]byte, BlockSize)
+	b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum)))
+
+	magic := binary.LittleEndian.Uint32(block[0:4])
+	if magic != XattrMagic {
+		return nil
+	}
+
+	var entries []XattrEntry
+	offset := XattrHeaderSize
+
+	for offset+XattrEntryHeaderSize <= BlockSize {
+		nameLen := int(block[offset])
+		if nameLen == 0 {
+			break
+		}
+
+		nameIndex := block[offset+1]
+		valueOffs := binary.LittleEndian.Uint16(block[offset+2 : offset+4])
+		valueSize := binary.LittleEndian.Uint32(block[offset+8 : offset+12])
+		// entryHash at offset+12:offset+16 - we don't need it for reading
+
+		if offset+XattrEntryHeaderSize+nameLen > BlockSize {
+			break
+		}
+
+		name := string(block[offset+XattrEntryHeaderSize : offset+XattrEntryHeaderSize+nameLen])
+
+		var value []byte
+		if valueSize > 0 && int(valueOffs)+int(valueSize) <= BlockSize {
+			value = make([]byte, valueSize)
+			copy(value, block[valueOffs:int(valueOffs)+int(valueSize)])
+		}
+
+		entries = append(entries, XattrEntry{
+			NameIndex: nameIndex,
+			Name:      name,
+			Value:     value,
+		})
+
+		// Entries are 4-byte aligned
+		entrySize := XattrEntryHeaderSize + nameLen
+		if entrySize%4 != 0 {
+			entrySize += 4 - (entrySize % 4)
+		}
+		offset += entrySize
+	}
+
+	return entries
+}
+
+// xattrEntryHash calculates the combined hash for an entry
+func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
+	const nameHashShift = 5
+	const valueHashShift = 16
+	const xattrRound = 3
+	const xattrPadBits = 2
+
+	// First compute name hash
+	hash := uint32(0)
+	for _, c := range []byte(name) {
+		hash = (hash << nameHashShift) ^ (hash >> (32 - nameHashShift)) ^ uint32(c)
+	}
+
+	// Continue (not XOR!) with value hash
+	if len(value) > 0 {
+		paddedLen := (len(value) + xattrRound) >> xattrPadBits
+		for i := 0; i < paddedLen; i++ {
+			var word uint32
+			offset := i * 4
+			for j := 0; j < 4 && offset+j < len(value); j++ {
+				word |= uint32(value[offset+j]) << (j * 8)
+			}
+			hash = (hash << valueHashShift) ^ (hash >> (32 - valueHashShift)) ^ word
+		}
+	}
+
+	return hash
+}
+
+// xattrBlockHash calculates the block hash from all entry hashes
+func xattrBlockHash(entryHashes []uint32) uint32 {
+	const blockHashShift = 16
+
+	hash := uint32(0)
+	for _, entryHash := range entryHashes {
+		if entryHash == 0 {
+			return 0
+		}
+		hash = (hash << blockHashShift) ^ (hash >> (32 - blockHashShift)) ^ entryHash
+	}
+	return hash
 }

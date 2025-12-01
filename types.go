@@ -1,9 +1,5 @@
 package ext4fs
 
-// ============================================================================
-// Constants - ext4 on-disk format
-// ============================================================================
-
 const (
 	// Block geometry
 	SectorSize     = 512
@@ -87,6 +83,21 @@ const (
 	BGInodeUninit = 0x0001 // Inode table not initialized
 	BGBlockUninit = 0x0002 // Block bitmap not initialized
 	BGInodeZeroed = 0x0004 // Inode table zeroed
+
+	// Xattr magic
+	XattrMagic = 0xEA020000
+
+	// Xattr name indexes (namespaces)
+	XattrIndexUser            = 1
+	XattrIndexPosixACLAccess  = 2
+	XattrIndexPosixACLDefault = 3
+	XattrIndexTrusted         = 4
+	XattrIndexSecurity        = 6
+	XattrIndexSystem          = 7
+
+	// Xattr block layout
+	XattrHeaderSize      = 32
+	XattrEntryHeaderSize = 16
 )
 
 // ============================================================================
@@ -294,4 +305,11 @@ type DirEntry struct {
 	NameLen uint8  // Name length
 	Type    uint8  // File type
 	Name    []byte // Name (up to 255)
+}
+
+// XattrEntry represents an extended attribute
+type XattrEntry struct {
+	NameIndex uint8
+	Name      string // Without namespace prefix
+	Value     []byte
 }
