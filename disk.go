@@ -58,11 +58,11 @@ type Ext4ImageBuilder struct {
 	disk      *fileBackend // File-based storage backend
 }
 
-// NewExt4ImageBuilder creates a new ext4 filesystem image at the specified path.
+// New creates a new ext4 filesystem image at the specified path.
 // The image size must be at least 4MB. Creates the necessary directory structure,
 // allocates the image file, and initializes the filesystem layout and builder.
 // Returns an Ext4ImageBuilder ready for filesystem construction operations.
-func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
+func New(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
 	if sizeMB < 4 {
 		return nil, fmt.Errorf("minimum size is 4MB")
 	}
@@ -104,6 +104,12 @@ func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error
 		imagePath: imagePath,
 		disk:      backend,
 	}, nil
+}
+
+// NewExt4ImageBuilder is kept for backward compatibility and simply
+// forwards to New. Prefer using New in new code.
+func NewExt4ImageBuilder(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
+	return New(imagePath, sizeMB)
 }
 
 // PrepareFilesystem initializes the core ext4 filesystem structures.
@@ -161,18 +167,14 @@ func (e *Ext4ImageBuilder) RemoveXattr(inodeNum uint32, name string) error {
 	return e.builder.RemoveXattr(inodeNum, name)
 }
 
-// FinalizeMetadata updates all filesystem metadata to reflect final state.
-// This includes recalculating block and inode usage statistics,
-// updating group descriptors, and ensuring the superblock is current.
-// Must be called after all file operations are complete.
-func (e *Ext4ImageBuilder) FinalizeMetadata() error {
-	return e.builder.FinalizeMetadata()
-}
-
-// Save synchronizes all pending writes to the underlying storage.
-// Ensures that all filesystem data is durably written to disk before
-// the image is considered complete and ready for use.
+// Save finalizes all filesystem metadata and synchronizes all pending writes
+// to the underlying storage. This updates block and inode usage statistics,
+// group descriptors, and the superblock, then ensures the image is durably
+// written to disk. Must be called after all file operations are complete.
 func (e *Ext4ImageBuilder) Save() error {
+	if err := e.builder.FinalizeMetadata(); err != nil {
+		return err
+	}
 	return e.disk.Sync()
 }
 

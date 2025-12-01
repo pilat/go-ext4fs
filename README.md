@@ -29,7 +29,7 @@ import (
 
 func main() {
     // Create 64MB ext4 image
-    builder, err := ext4fs.NewExt4ImageBuilder("disk.img", 64)
+    builder, err := ext4fs.New("disk.img", 64)
     if err != nil {
         panic(err)
     }
@@ -64,7 +64,6 @@ func main() {
     }
 
     // Finalize and save
-    builder.FinalizeMetadata()
     if err := builder.Save(); err != nil {
         panic(err)
     }

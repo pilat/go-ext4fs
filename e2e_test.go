@@ -46,7 +46,7 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 	tmpDir := t.TempDir()
 	imagePath := filepath.Join(tmpDir, "test.img")
 
-	builder, err := ext4fs.NewExt4ImageBuilder(imagePath, sizeMB)
+	builder, err := ext4fs.New(imagePath, sizeMB)
 	require.NoError(t, err, "failed to create ext4 image builder")
 
 	return &testContext{
@@ -61,9 +61,7 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 // and closes the builder. The image file is then ready for mounting and testing.
 func (tc *testContext) finalize() {
 	tc.t.Helper()
-	err := tc.builder.FinalizeMetadata()
-	require.NoError(tc.t, err, "failed to finalize metadata")
-	err = tc.builder.Save()
+	err := tc.builder.Save()
 	require.NoError(tc.t, err, "failed to save image")
 	err = tc.builder.Close()
 	require.NoError(tc.t, err, "failed to close builder")

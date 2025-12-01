@@ -8,7 +8,7 @@
 //
 // Example usage:
 //
-//	builder, err := ext4fs.NewExt4ImageBuilder("disk.img", 64)
+//	builder, err := ext4fs.New("disk.img", 64)
 //	if err != nil {
 //		panic(err)
 //	}
@@ -16,8 +16,9 @@
 //	builder.PrepareFilesystem()
 //	rootDir := builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
 //	builder.CreateFile(rootDir, "hostname", []byte("myhost\n"), 0644, 0, 0)
-//	builder.FinalizeMetadata()
-//	builder.Save()
+//	if err := builder.Save(); err != nil {
+//		panic(err)
+//	}
 package ext4fs
 
 const (
