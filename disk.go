@@ -63,6 +63,14 @@ type Ext4ImageBuilder struct {
 // allocates the image file, and initializes the filesystem layout and builder.
 // Returns an Ext4ImageBuilder ready for filesystem construction operations.
 func New(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
+	return NewWithCreatedAt(imagePath, sizeMB, uint32(time.Now().Unix()))
+}
+
+// NewWithCreatedAt creates a new ext4 filesystem image at the specified path,
+// using a fixed creation timestamp. This is primarily intended for deterministic
+// testing and fixtures generation, where the on-disk layout must be identical
+// across different Go versions and architectures.
+func NewWithCreatedAt(imagePath string, sizeMB int, createdAt uint32) (*Ext4ImageBuilder, error) {
 	if sizeMB < 4 {
 		return nil, fmt.Errorf("minimum size is 4MB")
 	}
@@ -95,7 +103,7 @@ func New(imagePath string, sizeMB int) (*Ext4ImageBuilder, error) {
 	backend := &fileBackend{f: f}
 
 	// Calculate layout
-	layout, err := CalculateLayout(partitionStart, partitionSize, uint32(time.Now().Unix()))
+	layout, err := CalculateLayout(partitionStart, partitionSize, createdAt)
 	if err != nil {
 		f.Close()
 		return nil, err
