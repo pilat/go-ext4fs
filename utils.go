@@ -20,6 +20,7 @@ func isSparseGroup(group uint32) bool {
 			}
 		}
 	}
+
 	return false
 }
 
@@ -30,17 +31,22 @@ func validateName(name string) error {
 	if len(name) == 0 {
 		return fmt.Errorf("filename cannot be empty")
 	}
+
 	if len(name) > 255 {
 		return fmt.Errorf("filename too long: %d > 255", len(name))
 	}
+
 	if strings.Contains(name, "/") {
 		return fmt.Errorf("filename cannot contain '/'")
 	}
+
 	if strings.Contains(name, "\x00") {
 		return fmt.Errorf("filename cannot contain null byte")
 	}
+
 	if name == "." || name == ".." {
 		return fmt.Errorf("filename cannot be '.' or '..'")
 	}
+
 	return nil
 }

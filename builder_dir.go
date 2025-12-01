@@ -8,19 +8,20 @@ import (
 // writeDirBlock writes a block containing directory entries to disk.
 // Directory entries are packed into the block with proper record length calculations
 // to ensure correct parsing. The block becomes part of the directory's data extent.
-func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) error {
-	block := make([]byte, BlockSize)
+func (b *builder) writeDirBlock(blockNum uint32, entries []dirEntry) error {
+	block := make([]byte, blockSize)
 	offset := 0
 
 	for i, entry := range entries {
 		nameLen := len(entry.Name)
+
 		recLen := 8 + nameLen
 		if recLen%4 != 0 {
 			recLen += 4 - (recLen % 4)
 		}
 
 		if i == len(entries)-1 {
-			recLen = BlockSize - offset
+			recLen = blockSize - offset
 		}
 
 		binary.LittleEndian.PutUint32(block[offset:], entry.Inode)
@@ -32,26 +33,29 @@ func (b *Builder) writeDirBlock(blockNum uint32, entries []DirEntry) error {
 		offset += recLen
 	}
 
-	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
 	}
+
 	return nil
 }
 
 // addDirEntry adds a new directory entry to the specified directory.
 // Searches existing directory blocks for space, or allocates new blocks if needed.
 // Updates the directory's size and block allocation as entries are added.
-func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
+func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 	inode, err := b.readInode(dirInode)
 	if err != nil {
 		return fmt.Errorf("failed to read directory inode: %w", err)
 	}
+
 	dataBlocks, err := b.getInodeBlocks(inode)
 	if err != nil {
 		return fmt.Errorf("failed to get directory blocks: %w", err)
 	}
 
 	newNameLen := len(entry.Name)
+
 	newRecLen := 8 + newNameLen
 	if newRecLen%4 != 0 {
 		newRecLen += 4 - (newRecLen % 4)
@@ -75,14 +79,14 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 		return err
 	}
 
-	block := make([]byte, BlockSize)
+	block := make([]byte, blockSize)
 	binary.LittleEndian.PutUint32(block[0:], entry.Inode)
-	binary.LittleEndian.PutUint16(block[4:], uint16(BlockSize))
+	binary.LittleEndian.PutUint16(block[4:], uint16(blockSize))
 	block[6] = uint8(newNameLen)
 	block[7] = entry.Type
 	copy(block[8:], entry.Name)
 
-	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(newBlock))); err != nil {
+	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(newBlock))); err != nil {
 		return fmt.Errorf("failed to write directory block: %w", err)
 	}
 
@@ -90,8 +94,10 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 	if err != nil {
 		return fmt.Errorf("failed to re-read directory inode: %w", err)
 	}
-	inode.SizeLo += BlockSize
-	inode.BlocksLo += BlockSize / 512
+
+	inode.SizeLo += blockSize
+
+	inode.BlocksLo += blockSize / 512
 	if err := b.writeInode(dirInode, inode); err != nil {
 		return fmt.Errorf("failed to update directory inode: %w", err)
 	}
@@ -102,28 +108,32 @@ func (b *Builder) addDirEntry(dirInode uint32, entry DirEntry) error {
 // tryAddEntryToBlock attempts to add a directory entry to an existing directory block.
 // Returns true if the entry fits in the available space, false if the block is full.
 // Calculates proper record lengths to maintain directory entry structure integrity.
-func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen int) (bool, error) {
-	block := make([]byte, BlockSize)
-	if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen int) (bool, error) {
+	block := make([]byte, blockSize)
+	if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return false, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 	}
 
 	offset := 0
 	lastOffset := 0
-	for offset < BlockSize {
+
+	for offset < blockSize {
 		recLen := binary.LittleEndian.Uint16(block[offset+4:])
 		if recLen == 0 {
 			break
 		}
+
 		lastOffset = offset
 		offset += int(recLen)
 	}
 
 	lastNameLen := int(block[lastOffset+6])
+
 	lastActualSize := 8 + lastNameLen
 	if lastActualSize%4 != 0 {
 		lastActualSize += 4 - (lastActualSize % 4)
 	}
+
 	lastRecLen := int(binary.LittleEndian.Uint16(block[lastOffset+4:]))
 
 	spaceAvailable := lastRecLen - lastActualSize
@@ -134,7 +144,7 @@ func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen 
 	binary.LittleEndian.PutUint16(block[lastOffset+4:], uint16(lastActualSize))
 
 	newOffset := lastOffset + lastActualSize
-	remaining := BlockSize - newOffset
+	remaining := blockSize - newOffset
 
 	binary.LittleEndian.PutUint32(block[newOffset:], entry.Inode)
 	binary.LittleEndian.PutUint16(block[newOffset+4:], uint16(remaining))
@@ -142,33 +152,35 @@ func (b *Builder) tryAddEntryToBlock(blockNum uint32, entry DirEntry, newRecLen 
 	block[newOffset+7] = entry.Type
 	copy(block[newOffset+8:], entry.Name)
 
-	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return false, fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
 	}
+
 	return true, nil
 }
 
 // findEntry searches for a directory entry with the specified name.
 // Returns the inode number if found, or 0 if the entry doesn't exist.
 // Used to check for existing files before creation or overwriting.
-func (b *Builder) findEntry(dirInode uint32, name string) (uint32, error) {
+func (b *builder) findEntry(dirInode uint32, name string) (uint32, error) {
 	inode, err := b.readInode(dirInode)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read directory inode for entry search: %w", err)
 	}
+
 	dataBlocks, err := b.getInodeBlocks(inode)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get directory blocks for entry search: %w", err)
 	}
 
 	for _, blockNum := range dataBlocks {
-		block := make([]byte, BlockSize)
-		if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+		block := make([]byte, blockSize)
+		if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 			return 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 		}
 
 		offset := 0
-		for offset < BlockSize {
+		for offset < blockSize {
 			recLen := binary.LittleEndian.Uint16(block[offset+4:])
 			if recLen == 0 {
 				break

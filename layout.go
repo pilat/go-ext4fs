@@ -49,13 +49,13 @@ func CalculateLayout(partitionStart, partitionSize uint64, createdAt uint32) (*L
 		return nil, fmt.Errorf("partition too small: need at least 4MB, got %d", partitionSize)
 	}
 
-	totalBlocks := uint32(partitionSize / BlockSize)
-	groupCount := (totalBlocks + BlocksPerGroup - 1) / BlocksPerGroup
+	totalBlocks := uint32(partitionSize / blockSize)
+	groupCount := (totalBlocks + blocksPerGroup - 1) / blocksPerGroup
 
 	// Limit to reasonable number of groups for now
 	if groupCount > 256 {
 		groupCount = 256
-		totalBlocks = groupCount * BlocksPerGroup
+		totalBlocks = groupCount * blocksPerGroup
 	}
 
 	l := &Layout{
@@ -63,9 +63,9 @@ func CalculateLayout(partitionStart, partitionSize uint64, createdAt uint32) (*L
 		PartitionSize:    partitionSize,
 		TotalBlocks:      totalBlocks,
 		GroupCount:       groupCount,
-		BlocksPerGroup:   BlocksPerGroup,
-		InodesPerGroup:   InodesPerGroup,
-		InodeTableBlocks: (InodesPerGroup * InodeSize) / BlockSize,
+		BlocksPerGroup:   blocksPerGroup,
+		InodesPerGroup:   inodesPerGroup,
+		InodeTableBlocks: (inodesPerGroup * inodeSize) / blockSize,
 		CreatedAt:        createdAt,
 	}
 
@@ -78,7 +78,7 @@ func CalculateLayout(partitionStart, partitionSize uint64, createdAt uint32) (*L
 // placement to optimize metadata distribution.
 func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 	gl := GroupLayout{
-		GroupStart: group * BlocksPerGroup,
+		GroupStart: group * blocksPerGroup,
 	}
 
 	// Calculate actual blocks in this group
@@ -86,7 +86,7 @@ func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 		// Last group may have fewer blocks
 		gl.BlocksInGroup = l.TotalBlocks - gl.GroupStart
 	} else {
-		gl.BlocksInGroup = BlocksPerGroup
+		gl.BlocksInGroup = blocksPerGroup
 	}
 
 	// Group 0 always has superblock and GDT
@@ -101,7 +101,7 @@ func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 
 		gl.GDTStart = nextBlock
 		// GDT needs enough blocks for all group descriptors
-		gl.GDTBlocks = (l.GroupCount*32 + BlockSize - 1) / BlockSize
+		gl.GDTBlocks = (l.GroupCount*32 + blockSize - 1) / blockSize
 		nextBlock += gl.GDTBlocks
 	}
 
@@ -123,7 +123,7 @@ func (l *Layout) GetGroupLayout(group uint32) GroupLayout {
 // BlockOffset returns the absolute byte offset for a given block number.
 // Converts logical block numbers to physical byte positions within the partition.
 func (l *Layout) BlockOffset(blockNum uint32) uint64 {
-	return l.PartitionStart + uint64(blockNum)*BlockSize
+	return l.PartitionStart + uint64(blockNum)*blockSize
 }
 
 // InodeOffset returns the absolute byte offset for a given inode number.
@@ -135,17 +135,18 @@ func (l *Layout) InodeOffset(inodeNum uint32) uint64 {
 	}
 
 	// Determine which group this inode belongs to
-	group := (inodeNum - 1) / InodesPerGroup
-	indexInGroup := (inodeNum - 1) % InodesPerGroup
+	group := (inodeNum - 1) / inodesPerGroup
+	indexInGroup := (inodeNum - 1) % inodesPerGroup
 
 	gl := l.GetGroupLayout(group)
-	return l.BlockOffset(gl.InodeTableStart) + uint64(indexInGroup)*InodeSize
+
+	return l.BlockOffset(gl.InodeTableStart) + uint64(indexInGroup)*inodeSize
 }
 
 // TotalInodes returns the total number of inodes available in the filesystem.
 // Calculated as the number of block groups multiplied by inodes per group.
 func (l *Layout) TotalInodes() uint32 {
-	return l.GroupCount * InodesPerGroup
+	return l.GroupCount * inodesPerGroup
 }
 
 // TotalFreeBlocks calculates the initial number of free blocks available for data.
@@ -153,13 +154,16 @@ func (l *Layout) TotalInodes() uint32 {
 // from the total blocks to determine usable data space.
 func (l *Layout) TotalFreeBlocks() uint32 {
 	var overhead uint32
+
 	for g := uint32(0); g < l.GroupCount; g++ {
 		gl := l.GetGroupLayout(g)
 		overhead += gl.OverheadBlocks
 	}
+
 	if l.TotalBlocks > overhead {
 		return l.TotalBlocks - overhead
 	}
+
 	return 0
 }
 

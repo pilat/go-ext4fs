@@ -6,7 +6,7 @@ import (
 
 var DEBUG = false
 
-type Builder struct {
+type builder struct {
 	disk   diskBackend
 	layout *Layout
 	debug  bool // Enable debug output
@@ -24,15 +24,15 @@ type Builder struct {
 // newBuilder creates a new Builder instance with initialized allocation state.
 // It sets up per-group tracking for block and inode allocation, preparing
 // the builder for filesystem construction operations.
-func newBuilder(disk diskBackend, layout *Layout) *Builder {
-	b := &Builder{
+func newBuilder(disk diskBackend, layout *Layout) *builder {
+	b := &builder{
 		disk:                disk,
 		layout:              layout,
 		debug:               DEBUG,
 		nextBlockPerGroup:   make([]uint32, layout.GroupCount),
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeBlockList:       make([]uint32, 0),
-		nextInode:           FirstNonResInode,
+		nextInode:           firstNonResInode,
 		usedDirsPerGroup:    make([]uint16, layout.GroupCount),
 	}
 
@@ -45,11 +45,11 @@ func newBuilder(disk diskBackend, layout *Layout) *Builder {
 	return b
 }
 
-// PrepareFilesystem initializes the complete ext4 filesystem structure.
+// prepareFilesystem initializes the complete ext4 filesystem structure.
 // This includes writing the superblock, group descriptors, initializing
 // bitmaps, zeroing inode tables, and creating essential directories like
 // root and lost+found. This method must be called before any file operations.
-func (b *Builder) PrepareFilesystem() error {
+func (b *builder) prepareFilesystem() error {
 	if b.debug {
 		fmt.Println(b.layout.String())
 		fmt.Println()
@@ -58,18 +58,23 @@ func (b *Builder) PrepareFilesystem() error {
 	if err := b.writeSuperblock(); err != nil {
 		return err
 	}
+
 	if err := b.writeGroupDescriptors(); err != nil {
 		return err
 	}
+
 	if err := b.initBitmaps(); err != nil {
 		return err
 	}
+
 	if err := b.zeroInodeTables(); err != nil {
 		return err
 	}
+
 	if err := b.createRootDirectory(); err != nil {
 		return err
 	}
+
 	if err := b.createLostFound(); err != nil {
 		return err
 	}
@@ -77,5 +82,6 @@ func (b *Builder) PrepareFilesystem() error {
 	if DEBUG {
 		fmt.Println("✓ Filesystem prepared successfully")
 	}
+
 	return nil
 }

@@ -3,7 +3,10 @@ package ext4fs_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +24,13 @@ const (
 	dockerImage = "alpine:latest"
 	// Default test image size in MB
 	defaultImageSizeMB = 64
+
+	stickyBit = 0o1000
+
+	// Fixture settings for deterministic full-features image
+	fixtureSizeMB     = 64
+	fixturesCreatedAt = uint32(1600000000)
+	expectedSHA256Hex = "b151e41a072581c31ddfc09992c272b6fd4e631aac3163eec7814212e82678a7"
 )
 
 // testContext holds resources and state for a single end-to-end test case.
@@ -28,7 +38,7 @@ const (
 type testContext struct {
 	t         *testing.T
 	imagePath string
-	builder   *ext4fs.Ext4ImageBuilder
+	builder   *ext4fs.Image
 }
 
 // newTestContext creates a new test context with a temporary image file and builder.
@@ -39,6 +49,7 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 
 	prevDebug := ext4fs.DEBUG
 	ext4fs.DEBUG = true
+
 	defer func() {
 		ext4fs.DEBUG = prevDebug
 	}()
@@ -46,7 +57,7 @@ func newTestContext(t *testing.T, sizeMB int) *testContext {
 	tmpDir := t.TempDir()
 	imagePath := filepath.Join(tmpDir, "test.img")
 
-	builder, err := ext4fs.New(imagePath, sizeMB)
+	builder, err := ext4fs.New(ext4fs.WithImagePath(imagePath), ext4fs.WithSizeInMB(sizeMB))
 	require.NoError(t, err, "failed to create ext4 image builder")
 
 	return &testContext{
@@ -114,14 +125,18 @@ umount /mnt/ext4
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
+
 	var stdout, stderr bytes.Buffer
+
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err = cmd.Run()
+
 	if ctx.Err() == context.DeadlineExceeded {
 		return stdout.String(), stderr.String(), fmt.Errorf("docker command timed out after 60s")
 	}
+
 	return stdout.String(), stderr.String(), err
 }
 
@@ -130,10 +145,12 @@ umount /mnt/ext4
 // Simplifies test code by handling error checking internally.
 func (tc *testContext) dockerExecSimple(commands ...string) string {
 	tc.t.Helper()
+
 	stdout, stderr, err := tc.dockerExec(commands...)
 	if err != nil {
 		tc.t.Fatalf("docker exec failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 	}
+
 	return stdout
 }
 
@@ -141,6 +158,7 @@ func (tc *testContext) dockerExecSimple(commands ...string) string {
 // End-to-end tests require Docker to mount and validate the generated ext4 images.
 func skipIfNoDocker(t *testing.T) {
 	t.Helper()
+
 	cmd := exec.Command("docker", "info")
 	if err := cmd.Run(); err != nil {
 		t.Skip("Docker not available, skipping e2e test")
@@ -154,7 +172,6 @@ func TestBasicFilesystemCreation(t *testing.T) {
 	skipIfNoDocker(t)
 
 	tc := newTestContext(t, defaultImageSizeMB)
-	tc.builder.PrepareFilesystem()
 	tc.finalize()
 
 	// Verify the filesystem can be mounted and has basic structure
@@ -233,7 +250,6 @@ func TestFileCreation(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 
 			ctx.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(tc.content), tc.mode, tc.uid, tc.gid)
 
@@ -257,9 +273,11 @@ func TestFileCreation(t *testing.T) {
 			output := ctx.dockerExecSimple(commands...)
 
 			assert.Contains(t, output, "file exists")
+
 			if tc.content != "" {
 				assert.Contains(t, output, tc.content)
 			}
+
 			assert.Contains(t, output, fmt.Sprintf("%o", tc.mode))
 			assert.Contains(t, output, fmt.Sprintf("%d:%d", tc.uid, tc.gid))
 		})
@@ -365,7 +383,6 @@ func TestFileOverwriting(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 
 			filename := "testfile.txt"
 
@@ -398,6 +415,7 @@ func TestFileOverwriting(t *testing.T) {
 			output := ctx.dockerExecSimple(commands...)
 
 			assert.Contains(t, output, "file exists")
+
 			if tc.newContent != "" {
 				assert.Contains(t, output, tc.newContent)
 				// Only check that original content is not present if it's different from new content
@@ -407,6 +425,7 @@ func TestFileOverwriting(t *testing.T) {
 			} else {
 				assert.Contains(t, output, "file is empty")
 			}
+
 			assert.Contains(t, output, fmt.Sprintf("%o", tc.newMode))
 			assert.Contains(t, output, fmt.Sprintf("%d:%d", tc.newUID, tc.newGID))
 		})
@@ -418,7 +437,6 @@ func TestMultipleFileOverwrites(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	filename := "multi-overwrite.txt"
 
@@ -455,6 +473,7 @@ func TestMultipleFileOverwrites(t *testing.T) {
 	for i := 0; i < len(contents)-1; i++ {
 		assert.NotContains(t, output, contents[i])
 	}
+
 	assert.Contains(t, output, fmt.Sprintf("%o", modes[len(modes)-1]))
 	assert.Contains(t, output, fmt.Sprintf("%d:%d", uids[len(uids)-1], gids[len(gids)-1]))
 }
@@ -464,7 +483,6 @@ func TestOverwriteInSubdirectory(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create a subdirectory
 	subdir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
@@ -501,13 +519,13 @@ func TestDirectoryCreation(t *testing.T) {
 
 	testCases := []struct {
 		name      string
-		structure func(b *ext4fs.Ext4ImageBuilder)
+		structure func(b *ext4fs.Image)
 		verify    []string
 		expects   []string
 	}{
 		{
 			name: "single directory",
-			structure: func(b *ext4fs.Ext4ImageBuilder) {
+			structure: func(b *ext4fs.Image) {
 				b.CreateDirectory(ext4fs.RootInode, "mydir", 0755, 0, 0)
 			},
 			verify: []string{
@@ -518,7 +536,7 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "nested directories",
-			structure: func(b *ext4fs.Ext4ImageBuilder) {
+			structure: func(b *ext4fs.Image) {
 				dir1, err := b.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
 				require.NoError(t, err)
 				dir2, err := b.CreateDirectory(dir1, "level2", 0755, 0, 0)
@@ -532,8 +550,8 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "directory with sticky bit",
-			structure: func(b *ext4fs.Ext4ImageBuilder) {
-				b.CreateDirectory(ext4fs.RootInode, "tmp", 0777|ext4fs.S_ISVTX, 0, 0)
+			structure: func(b *ext4fs.Image) {
+				b.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
 			},
 			verify: []string{
 				`test -d "tmp" && echo "tmp exists"`,
@@ -543,7 +561,7 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "directory with custom ownership",
-			structure: func(b *ext4fs.Ext4ImageBuilder) {
+			structure: func(b *ext4fs.Image) {
 				b.CreateDirectory(ext4fs.RootInode, "userdir", 0750, 1000, 1000)
 			},
 			verify: []string{
@@ -554,7 +572,7 @@ func TestDirectoryCreation(t *testing.T) {
 		},
 		{
 			name: "multiple directories at same level",
-			structure: func(b *ext4fs.Ext4ImageBuilder) {
+			structure: func(b *ext4fs.Image) {
 				b.CreateDirectory(ext4fs.RootInode, "bin", 0755, 0, 0)
 				b.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
 				b.CreateDirectory(ext4fs.RootInode, "home", 0755, 0, 0)
@@ -570,7 +588,6 @@ func TestDirectoryCreation(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 			tc.structure(ctx.builder)
 			ctx.finalize()
 
@@ -589,13 +606,13 @@ func TestSymlinkCreation(t *testing.T) {
 
 	testCases := []struct {
 		name    string
-		setup   func(b *ext4fs.Ext4ImageBuilder)
+		setup   func(b *ext4fs.Image)
 		verify  []string
 		expects []string
 	}{
 		{
 			name: "simple symlink to file",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				b.CreateFile(ext4fs.RootInode, "original.txt", []byte("original content"), 0644, 0, 0)
 				b.CreateSymlink(ext4fs.RootInode, "link.txt", "original.txt", 0, 0)
 			},
@@ -608,7 +625,7 @@ func TestSymlinkCreation(t *testing.T) {
 		},
 		{
 			name: "symlink to directory",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "realdir", 0755, 0, 0)
 				require.NoError(t, err)
 				b.CreateFile(dir, "file.txt", []byte("in dir"), 0644, 0, 0)
@@ -622,7 +639,7 @@ func TestSymlinkCreation(t *testing.T) {
 		},
 		{
 			name: "relative symlink",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
 				require.NoError(t, err)
 				b.CreateFile(ext4fs.RootInode, "root.txt", []byte("root file"), 0644, 0, 0)
@@ -639,7 +656,6 @@ func TestSymlinkCreation(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 			tc.setup(ctx.builder)
 			ctx.finalize()
 
@@ -657,7 +673,6 @@ func TestComplexFilesystem(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create /etc with config files
 	etcDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
@@ -681,7 +696,7 @@ func TestComplexFilesystem(t *testing.T) {
 	ctx.builder.CreateFile(logDir, "messages", []byte("system started\n"), 0640, 0, 4)
 
 	// Create /tmp with sticky bit
-	ctx.builder.CreateDirectory(ext4fs.RootInode, "tmp", 0777|ext4fs.S_ISVTX, 0, 0)
+	ctx.builder.CreateDirectory(ext4fs.RootInode, "tmp", 0777|stickyBit, 0, 0)
 
 	// Create symlink
 	ctx.builder.CreateSymlink(userDir, "logs", "/var/log", 1000, 1000)
@@ -731,7 +746,6 @@ func TestLargeFile(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create a file larger than 4KB (one block)
 	// Use 16KB of data (4 blocks)
@@ -764,23 +778,23 @@ func TestFilesystemIntegrity(t *testing.T) {
 
 	testCases := []struct {
 		name  string
-		setup func(b *ext4fs.Ext4ImageBuilder)
+		setup func(b *ext4fs.Image)
 	}{
 		{
 			name: "empty filesystem",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				// Just the base filesystem
 			},
 		},
 		{
 			name: "filesystem with files",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				b.CreateFile(ext4fs.RootInode, "test.txt", []byte("test"), 0644, 0, 0)
 			},
 		},
 		{
 			name: "filesystem with directories",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				dir, err := b.CreateDirectory(ext4fs.RootInode, "subdir", 0755, 0, 0)
 				require.NoError(t, err)
 				b.CreateFile(dir, "nested.txt", []byte("nested"), 0644, 0, 0)
@@ -788,11 +802,12 @@ func TestFilesystemIntegrity(t *testing.T) {
 		},
 		{
 			name: "complex filesystem",
-			setup: func(b *ext4fs.Ext4ImageBuilder) {
+			setup: func(b *ext4fs.Image) {
 				for i := 0; i < 5; i++ {
 					dirName := fmt.Sprintf("dir%d", i)
 					dir, err := b.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
 					require.NoError(t, err)
+
 					for j := 0; j < 3; j++ {
 						fileName := fmt.Sprintf("file%d.txt", j)
 						content := fmt.Sprintf("Content of %s/%s\n", dirName, fileName)
@@ -806,7 +821,6 @@ func TestFilesystemIntegrity(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 			tc.setup(ctx.builder)
 			ctx.finalize()
 
@@ -834,7 +848,6 @@ func TestDifferentImageSizes(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("%dMB", tc.sizeMB), func(t *testing.T) {
 			ctx := newTestContext(t, tc.sizeMB)
-			ctx.builder.PrepareFilesystem()
 
 			// Add some content
 			ctx.builder.CreateFile(ext4fs.RootInode, "test.txt", []byte("test content"), 0644, 0, 0)
@@ -861,7 +874,6 @@ func TestFilesystemStatistics(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create some files to use space
 	ctx.builder.CreateFile(ext4fs.RootInode, "data.bin", make([]byte, 8192), 0644, 0, 0)
@@ -900,7 +912,6 @@ func TestSpecialFileNames(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 
 			content := fmt.Sprintf("Content of %s\n", tc.filename)
 			ctx.builder.CreateFile(ext4fs.RootInode, tc.filename, []byte(content), 0644, 0, 0)
@@ -922,7 +933,6 @@ func TestMultiBlockDirectory(t *testing.T) {
 	skipIfNoDocker(t)
 
 	tc := newTestContext(t, 128) // Use larger image for this test
-	tc.builder.PrepareFilesystem()
 
 	// Create a directory that will need multiple blocks
 	// Each directory entry takes roughly 12-24 bytes (depends on name length)
@@ -964,7 +974,6 @@ func TestMultiBlockDirectoryWithSymlinks(t *testing.T) {
 	skipIfNoDocker(t)
 
 	tc := newTestContext(t, 128)
-	tc.builder.PrepareFilesystem()
 
 	// Create a directory with mixed content types
 	testDir, err := tc.builder.CreateDirectory(ext4fs.RootInode, "mixed_dir", 0755, 0, 0)
@@ -1017,7 +1026,6 @@ func TestMultiBlockDirectoryNested(t *testing.T) {
 	skipIfNoDocker(t)
 
 	tc := newTestContext(t, 128)
-	tc.builder.PrepareFilesystem()
 
 	// Create nested structure with many files at each level
 	level1, err := tc.builder.CreateDirectory(ext4fs.RootInode, "level1", 0755, 0, 0)
@@ -1061,18 +1069,17 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 		tmpDir := b.TempDir()
 		imagePath := filepath.Join(tmpDir, "bench.img")
 
-		builder, err := ext4fs.New(imagePath, 64)
+		builder, err := ext4fs.New(ext4fs.WithImagePath(imagePath), ext4fs.WithSizeInMB(64))
 		if err != nil {
 			b.Fatal(err)
 		}
-
-		builder.PrepareFilesystem()
 
 		// Create some content
 		for j := 0; j < 10; j++ {
 			dirName := fmt.Sprintf("dir%d", j)
 			dir, err := builder.CreateDirectory(ext4fs.RootInode, dirName, 0755, 0, 0)
 			require.NoError(b, err)
+
 			for k := 0; k < 5; k++ {
 				fileName := fmt.Sprintf("file%d.txt", k)
 				content := fmt.Sprintf("Content %d-%d", j, k)
@@ -1084,6 +1091,7 @@ func BenchmarkFilesystemCreation(b *testing.B) {
 		if err := builder.Save(); err != nil {
 			b.Fatal(err)
 		}
+
 		if err := builder.Close(); err != nil {
 			b.Fatal(err)
 		}
@@ -1097,7 +1105,6 @@ func TestExtentTreeConversion(t *testing.T) {
 	skipIfNoDocker(t)
 
 	tc := newTestContext(t, 128)
-	tc.builder.PrepareFilesystem()
 
 	// Create a directory and add files until we trigger extent tree conversion
 	// Each file creates a directory entry, and when entries fill the first block,
@@ -1174,7 +1181,6 @@ func TestXattrBasic(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := newTestContext(t, defaultImageSizeMB)
-			ctx.builder.PrepareFilesystem()
 
 			// Create a file and set xattr
 			fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "testfile.txt", []byte("content"), 0644, 0, 0)
@@ -1221,7 +1227,6 @@ func TestXattrSELinux(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create files with different SELinux contexts
 	contexts := []struct {
@@ -1259,7 +1264,6 @@ func TestXattrMultiple(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "multi_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1295,7 +1299,6 @@ func TestXattrOnDirectory(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	dirInode, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "labeled_dir", 0755, 0, 0)
 	require.NoError(t, err)
@@ -1330,7 +1333,6 @@ func TestXattrOverwrite(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "overwrite.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1359,7 +1361,6 @@ func TestXattrLargeValue(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "large_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1390,7 +1391,6 @@ func TestXattrWithFileOverwrite(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create file with xattr
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "xattr_overwrite.txt", []byte("original"), 0644, 0, 0)
@@ -1425,7 +1425,6 @@ func TestXattrSymlink(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create target file
 	ctx.builder.CreateFile(ext4fs.RootInode, "target.txt", []byte("target content"), 0644, 0, 0)
@@ -1454,7 +1453,6 @@ func TestXattrCapabilities(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create an executable
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "ping_clone", []byte("#!/bin/sh\necho ping"), 0755, 0, 0)
@@ -1492,7 +1490,6 @@ func TestXattrRemove(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "remove_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1524,7 +1521,6 @@ func TestXattrList(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "list_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1561,7 +1557,6 @@ func TestXattrComplexFilesystem(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	// Create /etc with SELinux contexts
 	etcDir, err := ctx.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
@@ -1616,7 +1611,6 @@ func TestXattrManyFiles(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, 128) // Larger image
-	ctx.builder.PrepareFilesystem()
 
 	numFiles := 100
 
@@ -1651,7 +1645,6 @@ func TestXattrEmpty(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "empty_xattr.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1680,7 +1673,6 @@ func TestXattrPosixACL(t *testing.T) {
 	skipIfNoDocker(t)
 
 	ctx := newTestContext(t, defaultImageSizeMB)
-	ctx.builder.PrepareFilesystem()
 
 	fileInode, err := ctx.builder.CreateFile(ext4fs.RootInode, "acl_file.txt", []byte("content"), 0644, 0, 0)
 	require.NoError(t, err)
@@ -1710,4 +1702,112 @@ func TestXattrPosixACL(t *testing.T) {
 
 	// Just verify it doesn't crash and xattr exists
 	assert.NotEmpty(t, output)
+}
+
+// TestFullFeaturesFixtureFingerprint verifies that building the full-features
+// filesystem with a fixed createdAt timestamp produces a deterministic image
+// whose fingerprint (sha256 of "size:filehash") matches expectedSHA256Hex.
+func TestFullFeaturesFixtureFingerprint(t *testing.T) {
+	tmpDir := t.TempDir()
+	imagePath := filepath.Join(tmpDir, "full_features.img")
+
+	size, fileHash, err := buildAndHashFullFeaturesFixture(imagePath)
+	require.NoError(t, err)
+
+	actual := fixtureFingerprint(size, fileHash)
+	assert.Equal(t, expectedSHA256Hex, actual, "fingerprint mismatch: expected=%s actual=%s", expectedSHA256Hex, actual)
+}
+
+// buildAndHashFullFeaturesFixture builds the same fixture image as the
+// cmd/ext4-fixtures helper, then returns its size and sha256 hash.
+func buildAndHashFullFeaturesFixture(imagePath string) (uint64, string, error) {
+	// Ensure no stale file
+	_ = os.Remove(imagePath)
+
+	img, err := ext4fs.New(
+		ext4fs.WithImagePath(imagePath),
+		ext4fs.WithSizeInMB(fixtureSizeMB),
+		ext4fs.WithCreatedAt(fixturesCreatedAt),
+	)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to create image: %w", err)
+	}
+
+	defer func() {
+		_ = img.Close()
+		_ = os.Remove(imagePath)
+	}()
+
+	if err := buildFullFeaturesFixture(img); err != nil {
+		return 0, "", fmt.Errorf("fixture build failed: %w", err)
+	}
+
+	if err := img.Save(); err != nil {
+		return 0, "", fmt.Errorf("failed to save image: %w", err)
+	}
+
+	info, err := os.Stat(imagePath)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to stat image %q: %w", imagePath, err)
+	}
+
+	f, err := os.Open(imagePath)
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to open image %q: %w", imagePath, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, "", fmt.Errorf("failed to hash image %q: %w", imagePath, err)
+	}
+
+	sum := h.Sum(nil)
+
+	return uint64(info.Size()), hex.EncodeToString(sum), nil
+}
+
+// buildFullFeaturesFixture builds the full-features filesystem layout used
+// by the deterministic fixture fingerprint test.
+func buildFullFeaturesFixture(b *ext4fs.Image) error {
+	root := uint32(ext4fs.RootInode)
+
+	etcInode, err := b.CreateDirectory(root, "etc", 0o755, 0, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create /etc: %w", err)
+	}
+
+	_, err = b.CreateFile(etcInode, "hostname", []byte("ext4-fixture\n"), 0o644, 0, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create /etc/hostname: %w", err)
+	}
+
+	homeInode, err := b.CreateDirectory(root, "home", 0o755, 0, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create /home: %w", err)
+	}
+
+	userInode, err := b.CreateDirectory(homeInode, "user", 0o700, 1000, 1000)
+	if err != nil {
+		return fmt.Errorf("failed to create /home/user: %w", err)
+	}
+
+	_, err = b.CreateFile(userInode, "note.txt", []byte("hello from ext4 fixtures\n"), 0o600, 1000, 1000)
+	if err != nil {
+		return fmt.Errorf("failed to create /home/user/note.txt: %w", err)
+	}
+
+	if err := b.SetXattr(userInode, "user.comment", []byte("example user directory")); err != nil {
+		return fmt.Errorf("failed to set xattr on /home/user: %w", err)
+	}
+
+	return nil
+}
+
+// fixtureFingerprint computes the sha256 of "size:filehash".
+func fixtureFingerprint(size uint64, fileHash string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s", size, fileHash)
+
+	return hex.EncodeToString(h.Sum(nil))
 }

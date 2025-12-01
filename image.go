@@ -1,0 +1,149 @@
+package ext4fs
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// Image provides the public API for creating ext4 filesystem images.
+// It wraps the internal Builder with file-based storage and provides high-level
+// methods for filesystem construction, metadata management, and image persistence.
+type Image struct {
+	builder *builder     // Internal filesystem builder
+	backend *fileBackend // File-based storage backend
+
+	imagePath string // Path to the output image file
+	sizeBytes uint64 // Image size in Bytes
+	createdAt uint32 // Creation timestamp
+}
+
+// New creates a new ext4 filesystem image with the provided options.
+// The imagePath and sizeMB must be specified via options. Size must be at least 4MB.
+// Creates the necessary directory structure, allocates the image file, and initializes the filesystem layout and builder.
+// Returns an Image ready for filesystem construction operations.
+func New(opts ...ImageOption) (*Image, error) {
+	img := &Image{
+		createdAt: uint32(time.Now().Unix()),
+	}
+	for _, opt := range opts {
+		opt(img)
+	}
+
+	if img.imagePath == "" {
+		return nil, fmt.Errorf("imagePath is required")
+	}
+
+	if img.sizeBytes < 4*1024*1024 {
+		return nil, fmt.Errorf("minimum size is 4MB")
+	}
+
+	partitionStart := uint64(0) // 0 offset for raw ext4
+	partitionSize := img.sizeBytes - partitionStart
+
+	// Create directory if needed
+	dir := filepath.Dir(img.imagePath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Create/truncate file
+	f, err := os.OpenFile(img.imagePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open image file %s: %w", img.imagePath, err)
+	}
+
+	if err := f.Truncate(int64(img.sizeBytes)); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("failed to truncate image file: %w", err)
+	}
+
+	backend := &fileBackend{f: f}
+
+	// Calculate layout
+	layout, err := CalculateLayout(partitionStart, partitionSize, img.createdAt)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	img.builder = newBuilder(backend, layout)
+
+	img.backend = backend
+	if err := img.builder.prepareFilesystem(); err != nil {
+		return nil, fmt.Errorf("failed to prepare filesystem: %w", err)
+	}
+
+	return img, nil
+}
+
+// CreateDirectory creates a new directory under the specified parent directory.
+// Returns the inode number of the created directory, or an error if creation fails.
+// The directory will be initialized with "." and ".." entries.
+func (e *Image) CreateDirectory(parent uint32, name string, mode, uid, gid uint16) (uint32, error) {
+	return e.builder.createDirectory(parent, name, mode, uid, gid)
+}
+
+// CreateFile creates a new regular file with the specified content.
+// If a file with the same name exists, it will be overwritten.
+// Returns the inode number of the created or overwritten file.
+func (e *Image) CreateFile(parent uint32, name string, content []byte, mode, uid, gid uint16) (uint32, error) {
+	return e.builder.createFile(parent, name, content, mode, uid, gid)
+}
+
+// CreateSymlink creates a symbolic link pointing to the specified target path.
+// For targets <= 60 bytes, the target is stored directly in the inode.
+// For longer targets, a separate data block is allocated.
+func (e *Image) CreateSymlink(parent uint32, name, target string, uid, gid uint16) (uint32, error) {
+	return e.builder.createSymlink(parent, name, target, uid, gid)
+}
+
+// SetXattr sets an extended attribute on the specified inode.
+// Extended attributes use namespace prefixes like "user.", "trusted.", etc.
+// If the attribute already exists, its value is updated.
+func (e *Image) SetXattr(inodeNum uint32, name string, value []byte) error {
+	return e.builder.setXattr(inodeNum, name, value)
+}
+
+// GetXattr retrieves the value of an extended attribute from the specified inode.
+// Returns the attribute value as a byte slice, or an error if the attribute doesn't exist.
+func (e *Image) GetXattr(inodeNum uint32, name string) ([]byte, error) {
+	return e.builder.getXattr(inodeNum, name)
+}
+
+// ListXattrs returns a list of all extended attribute names for the specified inode.
+// Names include their namespace prefixes (e.g., "user.attr", "trusted.security").
+func (e *Image) ListXattrs(inodeNum uint32) ([]string, error) {
+	return e.builder.listXattrs(inodeNum)
+}
+
+// RemoveXattr removes an extended attribute from the specified inode.
+// If the attribute doesn't exist, no error is returned.
+// The xattr block may be deallocated if it becomes empty.
+func (e *Image) RemoveXattr(inodeNum uint32, name string) error {
+	return e.builder.removeXattr(inodeNum, name)
+}
+
+// Save finalizes the filesystem and saves the image to disk.
+// This includes finalizing the metadata, syncing the image, and closing the backend.
+// Returns an error if the operation fails.
+func (e *Image) Save() error {
+	if err := e.builder.finalizeMetadata(); err != nil {
+		return fmt.Errorf("failed to finalize metadata: %w", err)
+	}
+
+	if err := e.backend.sync(); err != nil {
+		return fmt.Errorf("failed to sync image: %w", err)
+	}
+
+	return nil
+}
+
+// Close closes the image and backend.
+// Returns an error if the operation fails.
+func (e *Image) Close() error {
+	return e.backend.close()
+}

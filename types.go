@@ -8,7 +8,7 @@
 //
 // Example usage:
 //
-//	builder, err := ext4fs.New("disk.img", 64)
+//	builder, err := ext4fs.New(ext4fs.WithImagePath("disk.img"), ext4fs.WithSize(64))
 //	if err != nil {
 //		panic(err)
 //	}
@@ -23,137 +23,110 @@ package ext4fs
 
 const (
 	// Block geometry
-	SectorSize     = 512
-	BlockSize      = 4096
-	BlockSizeLog   = 2 // block_size = 1024 << BlockSizeLog
-	BlocksPerGroup = 32768
-	InodesPerGroup = 8192
-	InodeSize      = 256
+	sectorSize     = 512
+	blockSize      = 4096
+	blockSizeLog   = 2 // block_size = 1024 << BlockSizeLog
+	blocksPerGroup = 32768
+	inodesPerGroup = 8192
+	inodeSize      = 256
 
 	// Superblock is always at byte offset 1024 from partition start
-	SuperblockOffset = 1024
+	superblockOffset = 1024
 
 	// Magic numbers
-	Ext4Magic    = 0xEF53
-	ExtentMagic  = 0xF30A
-	MBRSignature = 0xAA55
+	ext4Magic    = 0xEF53
+	extentMagic  = 0xF30A
+	mbrSignature = 0xAA55
 
 	// Reserved inodes
-	BadBlocksInode   = 1
+	badBlocksInode   = 1
 	RootInode        = 2
-	UserQuotaInode   = 3
-	GroupQuotaInode  = 4
-	BootLoaderInode  = 5
-	UndelDirInode    = 6
-	ResizeInode      = 7
-	JournalInode     = 8
-	ExcludeInode     = 9
-	ReplicaInode     = 10
-	FirstNonResInode = 11 // First inode for user data
+	userQuotaInode   = 3
+	groupQuotaInode  = 4
+	bootLoaderInode  = 5
+	undelDirInode    = 6
+	resizeInode      = 7
+	journalInode     = 8
+	excludeInode     = 9
+	replicaInode     = 10
+	firstNonResInode = 11 // First inode for user data
 
 	// Directory entry file types
-	FTUnknown = 0
-	FTRegFile = 1
-	FTDir     = 2
-	FTChrDev  = 3
-	FTBlkDev  = 4
-	FTFifo    = 5
-	FTSock    = 6
-	FTSymlink = 7
-	FTMax     = 8
+	ftUnknown = 0
+	ftRegFile = 1
+	ftDir     = 2
+	ftChrDev  = 3
+	ftBlkDev  = 4
+	ftFifo    = 5
+	ftSock    = 6
+	ftSymlink = 7
+	ftMax     = 8
 
 	// Inode mode bits
-	S_IXOTH  = 0o0001
-	S_IWOTH  = 0o0002
-	S_IROTH  = 0o0004
-	S_IXGRP  = 0o0010
-	S_IWGRP  = 0o0020
-	S_IRGRP  = 0o0040
-	S_IXUSR  = 0o0100
-	S_IWUSR  = 0o0200
-	S_IRUSR  = 0o0400
-	S_ISVTX  = 0o1000 // Sticky bit
-	S_ISGID  = 0o2000
-	S_ISUID  = 0o4000
-	S_IFIFO  = 0x1000
-	S_IFCHR  = 0x2000
-	S_IFDIR  = 0x4000
-	S_IFBLK  = 0x6000
-	S_IFREG  = 0x8000
-	S_IFLNK  = 0xA000
-	S_IFSOCK = 0xC000
+	s_IXOTH  = 0o0001
+	s_IWOTH  = 0o0002
+	s_IROTH  = 0o0004
+	s_IXGRP  = 0o0010
+	s_IWGRP  = 0o0020
+	s_IRGRP  = 0o0040
+	s_IXUSR  = 0o0100
+	s_IWUSR  = 0o0200
+	s_IRUSR  = 0o0400
+	s_ISVTX  = 0o1000
+	s_ISGID  = 0o2000
+	s_ISUID  = 0o4000
+	s_IFIFO  = 0x1000
+	s_IFCHR  = 0x2000
+	s_IFDIR  = 0x4000
+	s_IFBLK  = 0x6000
+	s_IFREG  = 0x8000
+	s_IFLNK  = 0xA000
+	s_IFSOCK = 0xC000
 
 	// Inode flags
-	InodeFlagExtents = 0x00080000
+	inodeFlagExtents = 0x00080000
 
 	// Feature flags - MINIMAL SET for kernel compatibility
 	// Compatible features (optional)
-	CompatExtAttr  = 0x0008
-	CompatDirIndex = 0x0020
+	compatExtAttr  = 0x0008
+	compatDirIndex = 0x0020
 
 	// Incompatible features (required)
-	IncompatFileType = 0x0002
-	IncompatExtents  = 0x0040
+	incompatFileType = 0x0002
+	incompatExtents  = 0x0040
 
 	// Read-only compatible features
-	ROCompatSparseSuper = 0x0001
-	ROCompatLargeFile   = 0x0002
-	ROCompatExtraIsize  = 0x0040
-
-	// Group descriptor flags
-	BGInodeUninit = 0x0001 // Inode table not initialized
-	BGBlockUninit = 0x0002 // Block bitmap not initialized
-	BGInodeZeroed = 0x0004 // Inode table zeroed
+	roCompatSparseSuper = 0x0001
+	roCompatLargeFile   = 0x0002
+	roCompatExtraIsize  = 0x0040
 
 	// Xattr magic
-	XattrMagic = 0xEA020000
+	xAttrMagic = 0xEA020000
 
 	// Xattr name indexes (namespaces)
-	XattrIndexUser            = 1
-	XattrIndexPosixACLAccess  = 2
-	XattrIndexPosixACLDefault = 3
-	XattrIndexTrusted         = 4
-	XattrIndexSecurity        = 6
-	XattrIndexSystem          = 7
+	xAttrIndexUser            = 1
+	xAttrIndexPosixACLAccess  = 2
+	xAttrIndexPosixACLDefault = 3
+	xAttrIndexTrusted         = 4
+	xAttrIndexSecurity        = 6
+	xAttrIndexSystem          = 7
 
 	// Xattr block layout
-	XattrHeaderSize      = 32
-	XattrEntryHeaderSize = 16
+	xAttrHeaderSize      = 32
+	xAttrEntryHeaderSize = 16
 )
 
 // ============================================================================
 // On-disk structures (must match kernel exactly)
 // ============================================================================
 
-// MBRPartition represents a single MBR partition table entry (16 bytes)
-// as defined in the Master Boot Record specification. Each partition
-// entry contains the partition's boot indicator, CHS addresses, type,
-// and LBA boundaries.
-type MBRPartition struct {
-	BootIndicator byte    // Boot indicator: 0x80 for bootable, 0x00 otherwise
-	StartCHS      [3]byte // Starting CHS address (Cylinder-Head-Sector)
-	PartType      byte    // Partition type identifier
-	EndCHS        [3]byte // Ending CHS address
-	StartLBA      uint32  // Starting LBA (Logical Block Address)
-	SizeLBA       uint32  // Size in LBA sectors
-}
-
-// MBR represents the Master Boot Record structure (512 bytes total)
-// located at the first sector of a disk. It contains boot code,
-// up to 4 primary partition entries, and the MBR signature.
-type MBR struct {
-	BootCode   [446]byte       // Boot loader code (446 bytes)
-	Partitions [4]MBRPartition // Four primary partition entries (64 bytes)
-	Signature  uint16          // MBR signature (0xAA55)
-}
-
-// Superblock represents the ext4 superblock structure (1024 bytes total)
+// superblock represents the ext4 superblock structure (1024 bytes total)
 // as defined in the Linux kernel's struct ext4_super_block. The superblock
 // contains global filesystem metadata including block counts, inode counts,
 // supported features, and maintenance information. It is located at offset
 // 1024 bytes from the start of the filesystem. Only fields needed for minimal
 // ext4 compatibility are included with correct byte offsets.
-type Superblock struct {
+type superblock struct {
 	InodesCount       uint32     // 0x00
 	BlocksCountLo     uint32     // 0x04
 	RBlocksCountLo    uint32     // 0x08
@@ -257,12 +230,12 @@ type Superblock struct {
 	Checksum          uint32     // 0x3FC
 }
 
-// GroupDesc32 represents the 32-byte block group descriptor structure
+// groupDesc32 represents the 32-byte block group descriptor structure
 // used in non-64bit ext4 filesystems. Each block group has a descriptor
 // that tracks the location of bitmaps, inode tables, and usage statistics
 // for that specific block group. This enables parallel operations across
 // multiple block groups.
-type GroupDesc32 struct {
+type groupDesc32 struct {
 	BlockBitmapLo     uint32 // Block bitmap block
 	InodeBitmapLo     uint32 // Inode bitmap block
 	InodeTableLo      uint32 // Inode table block
@@ -277,12 +250,12 @@ type GroupDesc32 struct {
 	Checksum          uint16 // Group checksum
 }
 
-// Inode represents the ext4 inode structure (256 bytes total)
+// inode represents the ext4 inode structure (256 bytes total)
 // as defined in the Linux kernel's struct ext4_inode. Each inode
 // contains metadata about a file or directory including ownership,
 // permissions, timestamps, and block pointers or extent tree root.
 // The inode number uniquely identifies each file system object.
-type Inode struct {
+type inode struct {
 	Mode        uint16   // 0x00: File mode
 	UID         uint16   // 0x02: Owner UID
 	SizeLo      uint32   // 0x04: Size in bytes (low)
@@ -319,34 +292,11 @@ type Inode struct {
 	Padding [96]byte // 0xA0-0xFF
 }
 
-// ExtentHeader represents the header of an ext4 extent tree node (12 bytes).
-// Extent trees replace traditional block pointers in inodes for files using
-// extents. The header contains metadata about the extent tree including
-// the number of entries, maximum entries, tree depth, and generation number.
-type ExtentHeader struct {
-	Magic      uint16 // 0xF30A
-	Entries    uint16 // Number of entries
-	Max        uint16 // Max entries
-	Depth      uint16 // Tree depth (0 = leaf)
-	Generation uint32 // Generation
-}
-
-// Extent represents a leaf node in the ext4 extent tree (12 bytes).
-// Each extent describes a contiguous range of blocks on disk that belong
-// to a file. Multiple extents can be combined to represent sparse files
-// or files with non-contiguous allocations.
-type Extent struct {
-	Block   uint32 // First logical block
-	Len     uint16 // Number of blocks
-	StartHi uint16 // Physical block high
-	StartLo uint32 // Physical block low
-}
-
-// DirEntry represents an ext4 directory entry with file type information.
+// dirEntry represents an ext4 directory entry with file type information.
 // Directory entries map filenames to inode numbers and contain metadata
 // about the file type. The structure is variable-length to accommodate
 // different filename lengths up to 255 bytes.
-type DirEntry struct {
+type dirEntry struct {
 	Inode   uint32 // Inode number
 	RecLen  uint16 // Record length
 	NameLen uint8  // Name length
@@ -354,11 +304,11 @@ type DirEntry struct {
 	Name    []byte // Name (up to 255)
 }
 
-// XattrEntry represents an extended attribute (xattr) attached to an inode.
+// xAttrEntry represents an extended attribute (xattr) attached to an inode.
 // Extended attributes provide additional metadata beyond standard file attributes,
 // organized into namespaces like user, trusted, security, and system.
 // Each xattr consists of a name index, name, and value.
-type XattrEntry struct {
+type xAttrEntry struct {
 	NameIndex uint8
 	Name      string // Without namespace prefix
 	Value     []byte

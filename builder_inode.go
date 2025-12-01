@@ -9,13 +9,13 @@ import (
 // makeDirectoryInode creates a new inode structure configured for a directory.
 // Directory inodes have specific mode flags and initial link count of 2
 // (accounting for "." and ".." entries). Timestamps are set to the filesystem creation time.
-func (b *Builder) makeDirectoryInode(mode, uid, gid uint16) Inode {
-	inode := Inode{
-		Mode:       S_IFDIR | mode,
+func (b *builder) makeDirectoryInode(mode, uid, gid uint16) inode {
+	inode := inode{
+		Mode:       s_IFDIR | mode,
 		UID:        uid,
 		GID:        gid,
 		LinksCount: 2,
-		Flags:      InodeFlagExtents,
+		Flags:      inodeFlagExtents,
 		Atime:      b.layout.CreatedAt,
 		Ctime:      b.layout.CreatedAt,
 		Mtime:      b.layout.CreatedAt,
@@ -23,21 +23,22 @@ func (b *Builder) makeDirectoryInode(mode, uid, gid uint16) Inode {
 		ExtraIsize: 32,
 	}
 	b.initExtentHeader(&inode)
+
 	return inode
 }
 
 // makeFileInode creates a new inode structure configured for a regular file.
 // The inode is initialized with the specified size, ownership, and permissions.
 // Regular files use extent trees for block mapping and have appropriate mode flags.
-func (b *Builder) makeFileInode(mode, uid, gid uint16, size uint64) Inode {
-	inode := Inode{
-		Mode:       S_IFREG | mode,
+func (b *builder) makeFileInode(mode, uid, gid uint16, size uint64) inode {
+	inode := inode{
+		Mode:       s_IFREG | mode,
 		UID:        uid,
 		GID:        gid,
 		SizeLo:     uint32(size & 0xFFFFFFFF),
 		SizeHi:     uint32(size >> 32),
 		LinksCount: 1,
-		Flags:      InodeFlagExtents,
+		Flags:      inodeFlagExtents,
 		Atime:      b.layout.CreatedAt,
 		Ctime:      b.layout.CreatedAt,
 		Mtime:      b.layout.CreatedAt,
@@ -45,17 +46,19 @@ func (b *Builder) makeFileInode(mode, uid, gid uint16, size uint64) Inode {
 		ExtraIsize: 32,
 	}
 	b.initExtentHeader(&inode)
+
 	return inode
 }
 
 // initExtentHeader initializes the extent tree header in an inode's block array.
 // The extent header is stored in the first 12 bytes of the inode's block field
 // and contains metadata about the extent tree structure and depth.
-func (b *Builder) initExtentHeader(inode *Inode) {
+func (b *builder) initExtentHeader(inode *inode) {
 	for i := range inode.Block {
 		inode.Block[i] = 0
 	}
-	binary.LittleEndian.PutUint16(inode.Block[0:2], ExtentMagic)
+
+	binary.LittleEndian.PutUint16(inode.Block[0:2], extentMagic)
 	binary.LittleEndian.PutUint16(inode.Block[2:4], 0)  // entries
 	binary.LittleEndian.PutUint16(inode.Block[4:6], 4)  // max entries
 	binary.LittleEndian.PutUint16(inode.Block[6:8], 0)  // depth
@@ -65,7 +68,7 @@ func (b *Builder) initExtentHeader(inode *Inode) {
 // setExtent sets a single extent mapping in an inode's extent tree.
 // Maps a contiguous range of logical blocks to physical blocks on disk.
 // Used for files that fit in a single extent or as part of a larger extent tree.
-func (b *Builder) setExtent(inode *Inode, logicalBlock, physicalBlock uint32, length uint16) {
+func (b *builder) setExtent(inode *inode, logicalBlock, physicalBlock uint32, length uint16) {
 	binary.LittleEndian.PutUint16(inode.Block[2:4], 1)
 	binary.LittleEndian.PutUint32(inode.Block[12:16], logicalBlock)
 	binary.LittleEndian.PutUint16(inode.Block[16:18], length)
@@ -77,7 +80,7 @@ func (b *Builder) setExtent(inode *Inode, logicalBlock, physicalBlock uint32, le
 // For small numbers of blocks, creates individual extents. For larger allocations,
 // may create an indexed extent tree structure. Blocks should be physically contiguous
 // within each extent but may be sparse across extents.
-func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
+func (b *builder) setExtentMultiple(inode *inode, blocks []uint32) error {
 	if len(blocks) == 0 {
 		return nil
 	}
@@ -90,6 +93,7 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 	}
 
 	var extents []extent
+
 	currentExtent := extent{
 		logical:  0,
 		physical: blocks[0],
@@ -109,11 +113,13 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 			}
 		}
 	}
+
 	extents = append(extents, currentExtent)
 
 	// If fits in inode (max 4 extents), write directly
 	if len(extents) <= 4 {
 		binary.LittleEndian.PutUint16(inode.Block[2:4], uint16(len(extents)))
+
 		for i, ext := range extents {
 			off := 12 + i*12
 			binary.LittleEndian.PutUint32(inode.Block[off:], ext.logical)
@@ -121,6 +127,7 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 			binary.LittleEndian.PutUint16(inode.Block[off+6:], 0)
 			binary.LittleEndian.PutUint32(inode.Block[off+8:], ext.physical)
 		}
+
 		return nil
 	}
 
@@ -130,12 +137,12 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 		return err
 	}
 
-	leaf := make([]byte, BlockSize)
+	leaf := make([]byte, blockSize)
 
 	// Write extent header for leaf
-	binary.LittleEndian.PutUint16(leaf[0:2], ExtentMagic)
+	binary.LittleEndian.PutUint16(leaf[0:2], extentMagic)
 	binary.LittleEndian.PutUint16(leaf[2:4], uint16(len(extents)))
-	binary.LittleEndian.PutUint16(leaf[4:6], (BlockSize-12)/12) // max entries
+	binary.LittleEndian.PutUint16(leaf[4:6], (blockSize-12)/12) // max entries
 	binary.LittleEndian.PutUint16(leaf[6:8], 0)                 // depth 0
 
 	// Write extents to leaf
@@ -147,7 +154,7 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 		binary.LittleEndian.PutUint32(leaf[off+8:], ext.physical)
 	}
 
-	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+	if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 		return fmt.Errorf("failed to write extent leaf block: %w", err)
 	}
 
@@ -155,7 +162,8 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 	for i := range inode.Block {
 		inode.Block[i] = 0
 	}
-	binary.LittleEndian.PutUint16(inode.Block[0:2], ExtentMagic)
+
+	binary.LittleEndian.PutUint16(inode.Block[0:2], extentMagic)
 	binary.LittleEndian.PutUint16(inode.Block[2:4], 1) // 1 index entry
 	binary.LittleEndian.PutUint16(inode.Block[4:6], 4) // max entries
 	binary.LittleEndian.PutUint16(inode.Block[6:8], 1) // depth 1
@@ -166,7 +174,7 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 	binary.LittleEndian.PutUint16(inode.Block[20:22], 0)         // leaf block hi
 
 	// Account for the leaf block in inode's block count
-	inode.BlocksLo += BlockSize / 512
+	inode.BlocksLo += blockSize / 512
 
 	return nil
 }
@@ -174,52 +182,57 @@ func (b *Builder) setExtentMultiple(inode *Inode, blocks []uint32) error {
 // writeInode writes an inode structure to its designated location in the inode table.
 // Inodes are stored in inode tables within their respective block groups.
 // The inode number determines which group and offset within the table to use.
-func (b *Builder) writeInode(inodeNum uint32, inode *Inode) error {
+func (b *builder) writeInode(inodeNum uint32, inode *inode) error {
 	var buf bytes.Buffer
 	if err := binary.Write(&buf, binary.LittleEndian, inode); err != nil {
 		return fmt.Errorf("failed to encode inode %d: %w", inodeNum, err)
 	}
-	if _, err := b.disk.WriteAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum))); err != nil {
+
+	if err := b.disk.writeAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum))); err != nil {
 		return fmt.Errorf("failed to write inode %d: %w", inodeNum, err)
 	}
+
 	return nil
 }
 
 // readInode reads an inode structure from its location in the inode table.
 // Returns a pointer to the inode data, which can be used for reading file metadata
 // or modifying inode attributes. The inode number determines the group and offset.
-func (b *Builder) readInode(inodeNum uint32) (*Inode, error) {
-	buf := make([]byte, InodeSize)
-	if _, err := b.disk.ReadAt(buf, int64(b.layout.InodeOffset(inodeNum))); err != nil {
+func (b *builder) readInode(inodeNum uint32) (*inode, error) {
+	buf := make([]byte, inodeSize)
+	if err := b.disk.readAt(buf, int64(b.layout.InodeOffset(inodeNum))); err != nil {
 		return nil, fmt.Errorf("failed to read inode %d: %w", inodeNum, err)
 	}
 
-	inode := &Inode{}
+	inode := &inode{}
 	if err := binary.Read(bytes.NewReader(buf), binary.LittleEndian, inode); err != nil {
 		return nil, fmt.Errorf("failed to decode inode %d: %w", inodeNum, err)
 	}
+
 	return inode, nil
 }
 
 // incrementLinkCount increases the hard link count for the specified inode.
 // This is called when a directory entry is added that references the inode,
 // ensuring the link count accurately reflects the number of directory references.
-func (b *Builder) incrementLinkCount(inodeNum uint32) error {
+func (b *builder) incrementLinkCount(inodeNum uint32) error {
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for link count increment: %w", err)
 	}
+
 	inode.LinksCount++
 	if err := b.writeInode(inodeNum, inode); err != nil {
 		return fmt.Errorf("failed to write inode after incrementing link count: %w", err)
 	}
+
 	return nil
 }
 
 // addBlockToInode adds a new block to a directory inode's extent tree.
 // Used when a directory grows beyond its current block allocation.
 // May convert from simple extents to indexed extents for large directories.
-func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
+func (b *builder) addBlockToInode(inodeNum, newBlock uint32) error {
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for block addition: %w", err)
@@ -239,9 +252,11 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 		binary.LittleEndian.PutUint16(inode.Block[16:], 1)
 		binary.LittleEndian.PutUint16(inode.Block[18:], 0)
 		binary.LittleEndian.PutUint32(inode.Block[20:], newBlock)
+
 		if err := b.writeInode(inodeNum, inode); err != nil {
 			return fmt.Errorf("failed to write inode after initializing extent: %w", err)
 		}
+
 		return nil
 	}
 
@@ -252,9 +267,11 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 
 	if lastStart+uint32(lastLen) == newBlock && lastLen < 32768 {
 		binary.LittleEndian.PutUint16(inode.Block[lastOff+4:], lastLen+1)
+
 		if err := b.writeInode(inodeNum, inode); err != nil {
 			return fmt.Errorf("failed to write inode after extending extent: %w", err)
 		}
+
 		return nil
 	}
 
@@ -271,6 +288,7 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint32(inode.Block[newOff+8:], newBlock)
 
 	binary.LittleEndian.PutUint16(inode.Block[2:4], entries+1)
+
 	if err := b.writeInode(inodeNum, inode); err != nil {
 		return fmt.Errorf("failed to write inode after adding extent entry: %w", err)
 	}
@@ -281,11 +299,12 @@ func (b *Builder) addBlockToInode(inodeNum, newBlock uint32) error {
 // convertToIndexedExtents converts a simple extent inode to use indexed extents.
 // Creates an extent index block to manage multiple extents efficiently.
 // Required when a file or directory exceeds the capacity of inline extent storage.
-func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
+func (b *builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for extent conversion: %w", err)
 	}
+
 	entries := binary.LittleEndian.Uint16(inode.Block[2:4])
 
 	leafBlock, err := b.allocateBlock()
@@ -293,10 +312,10 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 		return err
 	}
 
-	leaf := make([]byte, BlockSize)
-	binary.LittleEndian.PutUint16(leaf[0:], ExtentMagic)
+	leaf := make([]byte, blockSize)
+	binary.LittleEndian.PutUint16(leaf[0:], extentMagic)
 	binary.LittleEndian.PutUint16(leaf[2:], entries+1)
-	binary.LittleEndian.PutUint16(leaf[4:], (BlockSize-12)/12)
+	binary.LittleEndian.PutUint16(leaf[4:], (blockSize-12)/12)
 	binary.LittleEndian.PutUint16(leaf[6:], 0)
 
 	copy(leaf[12:], inode.Block[12:12+entries*12])
@@ -312,7 +331,7 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint16(leaf[newOff+6:], 0)
 	binary.LittleEndian.PutUint32(leaf[newOff+8:], newBlock)
 
-	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+	if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 		return fmt.Errorf("failed to write extent leaf block: %w", err)
 	}
 
@@ -320,7 +339,7 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 		inode.Block[i] = 0
 	}
 
-	binary.LittleEndian.PutUint16(inode.Block[0:], ExtentMagic)
+	binary.LittleEndian.PutUint16(inode.Block[0:], extentMagic)
 	binary.LittleEndian.PutUint16(inode.Block[2:], 1)
 	binary.LittleEndian.PutUint16(inode.Block[4:], 4)
 	binary.LittleEndian.PutUint16(inode.Block[6:], 1)
@@ -329,18 +348,19 @@ func (b *Builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint32(inode.Block[16:], leafBlock)
 	binary.LittleEndian.PutUint16(inode.Block[20:], 0)
 
-	inode.BlocksLo += BlockSize / 512
+	inode.BlocksLo += blockSize / 512
 
 	if err := b.writeInode(inodeNum, inode); err != nil {
 		return fmt.Errorf("failed to write inode after converting to indexed extents: %w", err)
 	}
+
 	return nil
 }
 
 // addBlockToIndexedInode adds a new block to an inode that uses indexed extents.
 // Updates the extent index structure to include the new extent mapping.
 // Handles the complexity of maintaining sorted extent indices.
-func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
+func (b *builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read indexed inode: %w", err)
@@ -348,8 +368,8 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 
 	leafBlock := binary.LittleEndian.Uint32(inode.Block[16:])
 
-	leaf := make([]byte, BlockSize)
-	if _, err := b.disk.ReadAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+	leaf := make([]byte, blockSize)
+	if err := b.disk.readAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 		return fmt.Errorf("failed to read extent leaf block: %w", err)
 	}
 
@@ -363,9 +383,11 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 
 	if lastStart+uint32(lastLen) == newBlock && lastLen < 32768 {
 		binary.LittleEndian.PutUint16(leaf[lastOff+4:], lastLen+1)
-		if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+
+		if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 			return fmt.Errorf("failed to write updated extent leaf: %w", err)
 		}
+
 		return nil
 	}
 
@@ -382,17 +404,19 @@ func (b *Builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
 	binary.LittleEndian.PutUint32(leaf[newOff+8:], newBlock)
 
 	binary.LittleEndian.PutUint16(leaf[2:4], entries+1)
-	if _, err := b.disk.WriteAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+
+	if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 		return fmt.Errorf("failed to write new extent leaf: %w", err)
 	}
+
 	return nil
 }
 
 // getInodeBlocks extracts all block numbers referenced by an inode's extent tree.
 // Parses the extent structures to return a complete list of data blocks allocated
 // to the file or directory. Supports both simple extents and complex extent trees.
-func (b *Builder) getInodeBlocks(inode *Inode) ([]uint32, error) {
-	if (inode.Flags & InodeFlagExtents) == 0 {
+func (b *builder) getInodeBlocks(inode *inode) ([]uint32, error) {
+	if (inode.Flags & inodeFlagExtents) == 0 {
 		return nil, nil
 	}
 
@@ -420,8 +444,8 @@ func (b *Builder) getInodeBlocks(inode *Inode) ([]uint32, error) {
 			off := 12 + i*12
 			leafBlock := binary.LittleEndian.Uint32(inode.Block[off+4:])
 
-			leafData := make([]byte, BlockSize)
-			if _, err := b.disk.ReadAt(leafData, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+			leafData := make([]byte, blockSize)
+			if err := b.disk.readAt(leafData, int64(b.layout.BlockOffset(leafBlock))); err != nil {
 				return nil, fmt.Errorf("failed to read extent leaf block %d: %w", leafBlock, err)
 			}
 

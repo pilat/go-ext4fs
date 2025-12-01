@@ -14,21 +14,22 @@ func parseXattrName(name string) (uint8, string, error) {
 		prefix string
 		index  uint8
 	}{
-		{"user.", XattrIndexUser},
-		{"security.", XattrIndexSecurity},
-		{"trusted.", XattrIndexTrusted},
-		{"system.posix_acl_access", XattrIndexPosixACLAccess},
-		{"system.posix_acl_default", XattrIndexPosixACLDefault},
-		{"system.", XattrIndexSystem},
+		{"user.", xAttrIndexUser},
+		{"security.", xAttrIndexSecurity},
+		{"trusted.", xAttrIndexTrusted},
+		{"system.posix_acl_access", xAttrIndexPosixACLAccess},
+		{"system.posix_acl_default", xAttrIndexPosixACLDefault},
+		{"system.", xAttrIndexSystem},
 	}
 
 	for _, p := range prefixes {
 		if strings.HasPrefix(name, p.prefix) {
 			shortName := strings.TrimPrefix(name, p.prefix)
 			// Special case for POSIX ACLs - name is empty
-			if p.index == XattrIndexPosixACLAccess || p.index == XattrIndexPosixACLDefault {
+			if p.index == xAttrIndexPosixACLAccess || p.index == xAttrIndexPosixACLDefault {
 				shortName = ""
 			}
+
 			return p.index, shortName, nil
 		}
 	}
@@ -41,102 +42,83 @@ func parseXattrName(name string) (uint8, string, error) {
 // Returns the full prefix including the dot (e.g., "user.", "trusted.").
 func xattrIndexToPrefix(index uint8) string {
 	switch index {
-	case XattrIndexUser:
+	case xAttrIndexUser:
 		return "user."
-	case XattrIndexSecurity:
+	case xAttrIndexSecurity:
 		return "security."
-	case XattrIndexTrusted:
+	case xAttrIndexTrusted:
 		return "trusted."
-	case XattrIndexPosixACLAccess:
+	case xAttrIndexPosixACLAccess:
 		return "system.posix_acl_access"
-	case XattrIndexPosixACLDefault:
+	case xAttrIndexPosixACLDefault:
 		return "system.posix_acl_default"
-	case XattrIndexSystem:
+	case xAttrIndexSystem:
 		return "system."
 	default:
 		return fmt.Sprintf("unknown(%d).", index)
 	}
 }
 
-// overwriteFile replaces the content of an existing file with new content.
-// Frees the old blocks and allocates new ones as needed for the new content size.
-// Updates the inode metadata while preserving the inode number.
-// Returns the inode number (same as input) on success.
-func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
-	// Read existing inode to get its blocks
-	oldInode, err := b.readInode(inodeNum)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read inode for overwrite: %w", err)
-	}
-
+// freeOldFileResources frees the blocks and xattr associated with an existing inode.
+func (b *builder) freeOldFileResources(oldInode *inode) error {
 	// Free the xattr block if present
 	if oldInode.FileACLLo != 0 {
 		if err := b.freeBlock(oldInode.FileACLLo); err != nil {
-			return 0, fmt.Errorf("failed to free xattr block during overwrite: %w", err)
+			return fmt.Errorf("failed to free xattr block during overwrite: %w", err)
 		}
 	}
 
 	// Free the old blocks
 	oldBlocks, err := b.getInodeBlocks(oldInode)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get old inode blocks during overwrite: %w", err)
+		return fmt.Errorf("failed to get old inode blocks during overwrite: %w", err)
 	}
+
 	for _, blk := range oldBlocks {
 		if err := b.freeBlock(blk); err != nil {
-			return 0, fmt.Errorf("failed to free old block %d during overwrite: %w", blk, err)
+			return fmt.Errorf("failed to free old block %d during overwrite: %w", blk, err)
 		}
 	}
 
 	// If the old inode had an extent tree (depth > 0), free the index blocks too
-	if (oldInode.Flags & InodeFlagExtents) != 0 {
+	if (oldInode.Flags & inodeFlagExtents) != 0 {
 		depth := binary.LittleEndian.Uint16(oldInode.Block[6:8])
 		if depth > 0 {
 			entries := binary.LittleEndian.Uint16(oldInode.Block[2:4])
 			for i := uint16(0); i < entries && i < 4; i++ {
 				off := 12 + i*12
+
 				leafBlock := binary.LittleEndian.Uint32(oldInode.Block[off+4:])
 				if err := b.freeBlock(leafBlock); err != nil {
-					return 0, fmt.Errorf("failed to free extent leaf block %d during overwrite: %w", leafBlock, err)
+					return fmt.Errorf("failed to free extent leaf block %d during overwrite: %w", leafBlock, err)
 				}
 			}
 		}
 	}
 
-	size := uint64(len(content))
-	blocksNeeded := uint32((size + BlockSize - 1) / BlockSize)
-	if blocksNeeded == 0 {
-		blocksNeeded = 1
+	return nil
+}
+
+// overwriteFile replaces the content of an existing file with new content.
+// Frees the old blocks and allocates new ones as needed for the new content size.
+// Updates the inode metadata while preserving the inode number.
+// Returns the inode number (same as input) on success.
+func (b *builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid uint16) (uint32, error) {
+	// Read existing inode to get its blocks
+	oldInode, err := b.readInode(inodeNum)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read inode for overwrite: %w", err)
 	}
 
-	inode := b.makeFileInode(mode, uid, gid, size)
-
-	blocks, err := b.allocateBlocks(blocksNeeded)
-	if err != nil {
+	if err := b.freeOldFileResources(oldInode); err != nil {
 		return 0, err
 	}
 
-	if blocksNeeded == 1 {
-		b.setExtent(&inode, 0, blocks[0], 1)
-	} else {
-		if err := b.setExtentMultiple(&inode, blocks); err != nil {
-			return 0, err
-		}
-	}
-	inode.BlocksLo = blocksNeeded * (BlockSize / 512)
+	inode := b.makeFileInode(mode, uid, gid, uint64(len(content)))
 
-	for i, blk := range blocks {
-		block := make([]byte, BlockSize)
-		start := uint64(i) * BlockSize
-		end := start + BlockSize
-		if end > size {
-			end = size
-		}
-		if start < size {
-			copy(block, content[start:end])
-		}
-		if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blk))); err != nil {
-			return 0, fmt.Errorf("failed to write file block %d: %w", blk, err)
-		}
+	inode, _, err = b.allocateAndWriteFileContent(inode, content)
+	if err != nil {
+		return 0, err
 	}
 
 	if err := b.writeInode(inodeNum, &inode); err != nil {
@@ -149,15 +131,16 @@ func (b *Builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 // writeXattrBlock writes extended attribute entries to a dedicated block.
 // Extended attributes are stored in a special format with hash-based ordering
 // for efficient lookup. The block is referenced from the inode's FileACLLo field.
-func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
-	block := make([]byte, BlockSize)
+func (b *builder) writeXattrBlock(blockNum uint32, entries []xAttrEntry) error {
+	block := make([]byte, blockSize)
 
-	entriesOffset := XattrHeaderSize
-	valuesEnd := BlockSize
+	entriesOffset := xAttrHeaderSize
+	valuesEnd := blockSize
 
 	// Sort entries for consistent ordering (by index, then name)
-	sortedEntries := make([]XattrEntry, len(entries))
+	sortedEntries := make([]xAttrEntry, len(entries))
 	copy(sortedEntries, entries)
+
 	for i := 0; i < len(sortedEntries)-1; i++ {
 		for j := i + 1; j < len(sortedEntries); j++ {
 			if sortedEntries[i].NameIndex > sortedEntries[j].NameIndex ||
@@ -173,12 +156,14 @@ func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 
 	for _, entry := range sortedEntries {
 		nameLen := len(entry.Name)
-		entrySize := XattrEntryHeaderSize + nameLen
+
+		entrySize := xAttrEntryHeaderSize + nameLen
 		if entrySize%4 != 0 {
 			entrySize += 4 - (entrySize % 4)
 		}
 
 		valueSize := len(entry.Value)
+
 		valueSizeAligned := valueSize
 		if valueSizeAligned%4 != 0 {
 			valueSizeAligned += 4 - (valueSizeAligned % 4)
@@ -206,7 +191,7 @@ func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 		binary.LittleEndian.PutUint32(block[entriesOffset+12:], entryHash)
 
 		// Write name
-		copy(block[entriesOffset+XattrEntryHeaderSize:], entry.Name)
+		copy(block[entriesOffset+xAttrEntryHeaderSize:], entry.Name)
 
 		entriesOffset += entrySize
 	}
@@ -215,36 +200,38 @@ func (b *Builder) writeXattrBlock(blockNum uint32, entries []XattrEntry) error {
 	blockHash := xattrBlockHash(entryHashes)
 
 	// Write header
-	binary.LittleEndian.PutUint32(block[0:4], XattrMagic)
+	binary.LittleEndian.PutUint32(block[0:4], xAttrMagic)
 	binary.LittleEndian.PutUint32(block[4:8], 1)           // refcount
 	binary.LittleEndian.PutUint32(block[8:12], 1)          // blocks
 	binary.LittleEndian.PutUint32(block[12:16], blockHash) // hash
 	// checksum at 16:20, reserved at 20:32 - leave as zero
 
-	if _, err := b.disk.WriteAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return fmt.Errorf("failed to write xattr block %d: %w", blockNum, err)
 	}
+
 	return nil
 }
 
 // readXattrBlock reads extended attribute entries from a dedicated block.
 // Parses the special xattr block format to extract name-value pairs.
 // Returns a slice of XattrEntry structures for further processing.
-func (b *Builder) readXattrBlock(blockNum uint32) ([]XattrEntry, error) {
-	block := make([]byte, BlockSize)
-	if _, err := b.disk.ReadAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+func (b *builder) readXattrBlock(blockNum uint32) ([]xAttrEntry, error) {
+	block := make([]byte, blockSize)
+	if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return nil, fmt.Errorf("failed to read xattr block %d: %w", blockNum, err)
 	}
 
 	magic := binary.LittleEndian.Uint32(block[0:4])
-	if magic != XattrMagic {
+	if magic != xAttrMagic {
 		return nil, nil
 	}
 
-	var entries []XattrEntry
-	offset := XattrHeaderSize
+	var entries []xAttrEntry
 
-	for offset+XattrEntryHeaderSize <= BlockSize {
+	offset := xAttrHeaderSize
+
+	for offset+xAttrEntryHeaderSize <= blockSize {
 		nameLen := int(block[offset])
 		if nameLen == 0 {
 			break
@@ -256,29 +243,30 @@ func (b *Builder) readXattrBlock(blockNum uint32) ([]XattrEntry, error) {
 
 		// entryHash at offset+12:offset+16 - we don't need it for reading
 
-		if offset+XattrEntryHeaderSize+nameLen > BlockSize {
+		if offset+xAttrEntryHeaderSize+nameLen > blockSize {
 			break
 		}
 
-		name := string(block[offset+XattrEntryHeaderSize : offset+XattrEntryHeaderSize+nameLen])
+		name := string(block[offset+xAttrEntryHeaderSize : offset+xAttrEntryHeaderSize+nameLen])
 
 		var value []byte
-		if valueSize > 0 && int(valueOffs)+int(valueSize) <= BlockSize {
+		if valueSize > 0 && int(valueOffs)+int(valueSize) <= blockSize {
 			value = make([]byte, valueSize)
 			copy(value, block[valueOffs:int(valueOffs)+int(valueSize)])
 		}
 
-		entries = append(entries, XattrEntry{
+		entries = append(entries, xAttrEntry{
 			NameIndex: nameIndex,
 			Name:      name,
 			Value:     value,
 		})
 
 		// Entries are 4-byte aligned
-		entrySize := XattrEntryHeaderSize + nameLen
+		entrySize := xAttrEntryHeaderSize + nameLen
 		if entrySize%4 != 0 {
 			entrySize += 4 - (entrySize % 4)
 		}
+
 		offset += entrySize
 	}
 
@@ -289,10 +277,12 @@ func (b *Builder) readXattrBlock(blockNum uint32) ([]XattrEntry, error) {
 // The hash is used for ordering entries in the xattr block for efficient lookup.
 // Combines the namespace index, name, and value into a single hash value.
 func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
-	const nameHashShift = 5
-	const valueHashShift = 16
-	const xattrRound = 3
-	const xattrPadBits = 2
+	const (
+		nameHashShift  = 5
+		valueHashShift = 16
+		xattrRound     = 3
+		xattrPadBits   = 2
+	)
 
 	// First compute name hash
 	hash := uint32(0)
@@ -305,10 +295,12 @@ func xattrEntryHash(nameIndex uint8, name string, value []byte) uint32 {
 		paddedLen := (len(value) + xattrRound) >> xattrPadBits
 		for i := 0; i < paddedLen; i++ {
 			var word uint32
+
 			offset := i * 4
 			for j := 0; j < 4 && offset+j < len(value); j++ {
 				word |= uint32(value[offset+j]) << (j * 8)
 			}
+
 			hash = (hash << valueHashShift) ^ (hash >> (32 - valueHashShift)) ^ word
 		}
 	}
@@ -323,11 +315,14 @@ func xattrBlockHash(entryHashes []uint32) uint32 {
 	const blockHashShift = 16
 
 	hash := uint32(0)
+
 	for _, entryHash := range entryHashes {
 		if entryHash == 0 {
 			return 0
 		}
+
 		hash = (hash << blockHashShift) ^ (hash >> (32 - blockHashShift)) ^ entryHash
 	}
+
 	return hash
 }

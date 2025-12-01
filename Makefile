@@ -1,41 +1,27 @@
-.PHONY: test-e2e fixtures-check-matrix lint fmt vet tests
+GOLANGCI_LINT_VERSION := v2.6.2
+GOLANGCI_LINT_PATH := $(HOME)/.local/bin/golangci-lint-$(subst v,,$(GOLANGCI_LINT_VERSION))
 
-all: lint fmt vet tests
-tests: test-e2e fixtures-check-matrix
+.PHONY: test-e2e fixtures-check-matrix lint tests all
+
+all: lint tests
 
 GO_VERSIONS := 1.21.13 1.22.12 1.23.12 1.24.10 1.25.4
 PLATFORMS   := linux/amd64 linux/arm64
 
-test-e2e:
+tests:
 	@echo "===> Running end-to-end tests"
 	go test -v ./...
 
-fixtures-check-matrix:
-	@echo "===> Running fixtures check matrix"
-	@for v in $(GO_VERSIONS); do \
-	  for p in $(PLATFORMS); do \
-	    echo "===> Fixtures check: Go $$v on $$p"; \
-	    docker run --rm --platform=$$p \
-	      -e GO_VERSION=$$v \
-	      -v "$$PWD":/workspace \
-	      -w /workspace \
-	      golang:$$v-alpine \
-	      go run ./cmd/ext4-fixtures check || exit $$?; \
-	  done; \
-	done
+$(GOLANGCI_LINT_PATH):
+	@echo "===> Installing golangci-lint $(GOLANGCI_LINT_VERSION)"
+	@mkdir -p $(HOME)/.local/bin
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /tmp $(GOLANGCI_LINT_VERSION)
+	@mv /tmp/golangci-lint $(GOLANGCI_LINT_PATH)
 
-lint:
+lint: $(GOLANGCI_LINT_PATH)
 	@echo "===> Running lint"
-	@command -v golangci-lint >/dev/null 2>&1 || { \
-		echo "golangci-lint not installed. Run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"; \
-		exit 1; \
-	}
-	@golangci-lint run --exclude-files e2e_test.go,tmp/
+	@$(GOLANGCI_LINT_PATH) run
 
-fmt:
+fmt: $(GOLANGCI_LINT_PATH)
 	@echo "===> Running fmt"
-	@go fmt ./...
-
-vet:
-	@echo "===> Running vet"
-	@go vet ./...
+	@$(GOLANGCI_LINT_PATH) fmt

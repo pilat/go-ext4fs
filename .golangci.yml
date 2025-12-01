@@ -7,12 +7,26 @@ linters:
     - govet
     - ineffassign
     - staticcheck
-    - unused
-    - gosimple
     - goconst
     - gocyclo
     - misspell
-    - gofmt
-    - goimports
     - whitespace
     - nolintlint
+  settings:
+    gocyclo:
+      min-complexity: 15
+  exclusions:
+    paths:
+      - tmp
+      - cmd
+      - e2e_test\.go
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    paths:
+      - tmp
+      - cmd
+      - e2e_test\.go
