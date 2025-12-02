@@ -123,6 +123,7 @@ func TestExt4FS(t *testing.T) {
 		{"OverwriteInSubdirectory", testOverwriteInSubdirectory},
 		{"DirectoryCreation", testDirectoryCreation},
 		{"SymlinkCreation", testSymlinkCreation},
+		{"LongSymlink", testLongSymlink},
 		{"ComplexFilesystem", testComplexFilesystem},
 		{"LargeFile", testLargeFile},
 		{"FilesystemIntegrity", testFilesystemIntegrity},
@@ -133,6 +134,8 @@ func TestExt4FS(t *testing.T) {
 		{"MultiBlockDirectoryWithSymlinks", testMultiBlockDirectoryWithSymlinks},
 		{"MultiBlockDirectoryNested", testMultiBlockDirectoryNested},
 		{"ExtentTreeConversion", testExtentTreeConversion},
+		{"DirectoryExtentTree", testDirectoryExtentTree},
+		{"ExtentTreeLeafAllocation", testExtentTreeLeafAllocation},
 		{"XattrBasic", testXattrBasic},
 		{"XattrSELinux", testXattrSELinux},
 		{"XattrMultiple", testXattrMultiple},
@@ -619,6 +622,40 @@ func testSymlinkCreation(t *testing.T) {
 	}
 }
 
+func testLongSymlink(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create a deep directory structure to make a long path
+	parent := uint32(ext4fs.RootInode)
+	dirs := []string{"dir1", "dir2", "dir3", "dir4", "dir5", "dir6", "dir7"}
+	for _, dir := range dirs {
+		var err error
+		parent, err = env.builder.CreateDirectory(parent, dir, 0755, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Create a target file deep in the structure
+	_, err := env.builder.CreateFile(parent, "target.txt", []byte("target content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Create symlink target path >60 bytes
+	longTarget := "dir1/dir2/dir3/dir4/dir5/dir6/dir7/target.txt"
+	_, err = env.builder.CreateSymlink(ext4fs.RootInode, "longlink", longTarget, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -L "longlink" && echo "is symlink"`,
+		`readlink "longlink"`,
+		`cat "longlink"`,
+	)
+
+	assert.Contains(t, output, "is symlink")
+	assert.Contains(t, output, longTarget)
+	assert.Contains(t, output, "target content")
+}
+
 func testComplexFilesystem(t *testing.T) {
 	env := newTestEnv(t, defaultImageSizeMB)
 
@@ -775,7 +812,7 @@ func testFilesystemIntegrity(t *testing.T) {
 }
 
 func testDifferentImageSizes(t *testing.T) {
-	sizes := []int{16, 32, 64, 128}
+	sizes := []int{16, 32, 64, 128, 256, 512}
 
 	for _, sizeMB := range sizes {
 		t.Run(fmt.Sprintf("%dMB", sizeMB), func(t *testing.T) {
@@ -966,7 +1003,6 @@ func testMultiBlockDirectoryNested(t *testing.T) {
 		`ls -1 l2_file_* | wc -l`,
 		`cat l2_file_000.txt`,
 	)
-
 	assert.Contains(t, output, "200")
 	assert.Contains(t, output, "level2 exists")
 	assert.Contains(t, output, "level 2 content")
@@ -1003,6 +1039,65 @@ func testExtentTreeConversion(t *testing.T) {
 	assert.Contains(t, output, "last exists")
 	assert.Contains(t, output, "Content 0")
 	assert.Contains(t, output, "Content 499")
+}
+
+func testExtentTreeLeafAllocation(t *testing.T) {
+	env := newTestEnv(t, 128) // Larger image to have space
+
+	// Create a large file to allocate many contiguous blocks
+	largeContent := make([]byte, 20*4096)
+	for i := range largeContent {
+		largeContent[i] = byte(i % 256)
+	}
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "big1", largeContent, 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Overwrite it with small content, freeing the blocks
+	smallContent := []byte("small")
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "big1", smallContent, 0644, 0, 0)
+	require.NoError(t, err)
+
+	// Now create another large file, which should use the freed blocks (non-contiguous)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "big2", largeContent, 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "big1" && echo "big1 exists"`,
+		`test -f "big2" && echo "big2 exists"`,
+		`cat "big1"`,
+		`stat -c "%s" "big2"`,
+	)
+
+	assert.Contains(t, output, "big1 exists")
+	assert.Contains(t, output, "big2 exists")
+	assert.Contains(t, output, "small")
+	assert.Contains(t, output, fmt.Sprintf("%d", 20*4096))
+}
+func testDirectoryExtentTree(t *testing.T) {
+	env := newTestEnv(t, 128)
+
+	// Create a directory that will have many blocks
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "bigdir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	// Create many files with long names to fill directory blocks
+	for i := 0; i < 1000; i++ {
+		fileName := fmt.Sprintf("very_long_file_name_that_takes_up_space_%04d.txt", i)
+		_, err = env.builder.CreateFile(dir, fileName, []byte("content"), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`ls bigdir | wc -l`,
+		`test -d "bigdir" && echo "directory exists"`,
+	)
+
+	assert.Contains(t, output, "1000")
+	assert.Contains(t, output, "directory exists")
 }
 
 func testXattrBasic(t *testing.T) {
