@@ -87,7 +87,7 @@ func Open(opts ...ImageOption) (*Image, error) {
 	}
 
 	if img.backend == nil {
-		return nil, errors.New("image path is required: use WithExistingImagePath")
+		return nil, errors.New("backend is required: use WithExistingImagePath to open an existing image file")
 	}
 
 	// Load filesystem layout from superblock

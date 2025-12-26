@@ -77,8 +77,9 @@ func main() {
     defer img.Close()
 
     // Modify: delete old file, add new one
+    newInit := []byte("#!/bin/sh\nexec /bin/sh\n")
     img.Delete(ext4fs.RootInode, "old-init")
-    img.CreateFile(ext4fs.RootInode, "init", newInitBinary, 0755, 0, 0)
+    img.CreateFile(ext4fs.RootInode, "init", newInit, 0755, 0, 0)
 
     if err := img.Save(); err != nil {
         panic(err)

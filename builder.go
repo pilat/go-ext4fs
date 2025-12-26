@@ -72,14 +72,28 @@ func (b *builder) loadBitmaps() error {
 			return fmt.Errorf("read block bitmap for group %d: %w", g, err)
 		}
 
-		// Find first free block in this group by scanning from FirstDataBlock
-		b.nextBlockPerGroup[g] = gl.GroupStart + gl.BlocksInGroup // Assume all used
-		for i := gl.FirstDataBlock - gl.GroupStart; i < gl.BlocksInGroup; i++ {
+		// Scan block bitmap to find:
+		// 1. Highest allocated block (sets nextBlockPerGroup for new allocations)
+		// 2. Any free "holes" before that (adds to freeBlockList for reuse)
+		highestUsed := gl.FirstDataBlock - gl.GroupStart - 1 // Start before data area
+		dataStart := gl.FirstDataBlock - gl.GroupStart
+		for i := dataStart; i < gl.BlocksInGroup; i++ {
+			byteIdx := i / 8
+			bitIdx := i % 8
+			if blockBitmap[byteIdx]&(1<<bitIdx) != 0 {
+				highestUsed = i
+			}
+		}
+
+		// nextBlockPerGroup is one past the highest used block
+		b.nextBlockPerGroup[g] = gl.GroupStart + highestUsed + 1
+
+		// Find free blocks (holes) before nextBlockPerGroup and add to freeBlockList
+		for i := dataStart; i <= highestUsed; i++ {
 			byteIdx := i / 8
 			bitIdx := i % 8
 			if blockBitmap[byteIdx]&(1<<bitIdx) == 0 {
-				b.nextBlockPerGroup[g] = gl.GroupStart + i
-				break
+				b.freeBlockList = append(b.freeBlockList, gl.GroupStart+i)
 			}
 		}
 
