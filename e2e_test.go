@@ -2389,8 +2389,9 @@ func testOpenInvalidImage(t *testing.T) {
 
 	// Test opening standard ext4 image (created by mke2fs with default features)
 	// Standard mke2fs enables features like 64bit, flex_bg, etc. that we don't support
+	standardImgPath := filepath.Join(sharedContainerDir, "standard.img")
 	cmd := exec.Command("docker", "exec", dockerContainerID,
-		"mke2fs", "-t", "ext4", "-q", filepath.Join(sharedContainerDir, "standard.img"), "64M")
+		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M && chmod 666 %s", standardImgPath, standardImgPath))
 	if err := cmd.Run(); err == nil {
 		standardHostPath := filepath.Join(sharedHostDir, "standard.img")
 		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
