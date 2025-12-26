@@ -76,107 +76,153 @@ func (b *builder) setExtent(inode *inode, logicalBlock, physicalBlock uint32, le
 	binary.LittleEndian.PutUint32(inode.Block[20:24], physicalBlock)
 }
 
+// extent represents a contiguous range of blocks in an extent tree.
+type extent struct {
+	logical  uint32
+	physical uint32
+	length   uint16
+}
+
+// Maximum extents per leaf block: (4096 - 12 header) / 12 bytes per extent = 340
+const maxExtentsPerLeaf = (blockSize - 12) / 12
+
+// buildExtentList converts a list of block numbers into contiguous extents.
+func buildExtentList(blocks []uint32) []extent {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	var extents []extent
+	current := extent{logical: 0, physical: blocks[0], length: 1}
+
+	for i := 1; i < len(blocks); i++ {
+		if blocks[i] == current.physical+uint32(current.length) && current.length < 32768 {
+			current.length++
+		} else {
+			extents = append(extents, current)
+			current = extent{logical: uint32(i), physical: blocks[i], length: 1}
+		}
+	}
+
+	return append(extents, current)
+}
+
+// writeExtentToBuffer writes an extent entry at the specified offset in a buffer.
+func writeExtentToBuffer(buf []byte, off int, ext extent) {
+	binary.LittleEndian.PutUint32(buf[off:], ext.logical)
+	binary.LittleEndian.PutUint16(buf[off+4:], ext.length)
+	binary.LittleEndian.PutUint16(buf[off+6:], 0)
+	binary.LittleEndian.PutUint32(buf[off+8:], ext.physical)
+}
+
 // setExtentMultiple handles allocation of non-contiguous blocks by creating multiple extents.
 // For small numbers of blocks, creates individual extents. For larger allocations,
-// may create an indexed extent tree structure. Blocks should be physically contiguous
-// within each extent but may be sparse across extents.
+// creates an indexed extent tree with multiple leaf blocks.
+// Maximum supported: 1360 extents (4 leaf blocks × 340 extents per leaf).
 func (b *builder) setExtentMultiple(inode *inode, blocks []uint32) error {
 	if len(blocks) == 0 {
 		return nil
 	}
 
-	// Build list of contiguous extents
-	type extent struct {
-		logical  uint32
-		physical uint32
-		length   uint16
-	}
-
-	var extents []extent
-
-	currentExtent := extent{
-		logical:  0,
-		physical: blocks[0],
-		length:   1,
-	}
-
-	for i := 1; i < len(blocks); i++ {
-		// Check if contiguous with current extent
-		if blocks[i] == currentExtent.physical+uint32(currentExtent.length) && currentExtent.length < 32768 {
-			currentExtent.length++
-		} else {
-			extents = append(extents, currentExtent)
-			currentExtent = extent{
-				logical:  uint32(i),
-				physical: blocks[i],
-				length:   1,
-			}
-		}
-	}
-
-	extents = append(extents, currentExtent)
+	extents := buildExtentList(blocks)
 
 	// If fits in inode (max 4 extents), write directly
 	if len(extents) <= 4 {
 		binary.LittleEndian.PutUint16(inode.Block[2:4], uint16(len(extents)))
-
 		for i, ext := range extents {
-			off := 12 + i*12
-			binary.LittleEndian.PutUint32(inode.Block[off:], ext.logical)
-			binary.LittleEndian.PutUint16(inode.Block[off+4:], ext.length)
-			binary.LittleEndian.PutUint16(inode.Block[off+6:], 0)
-			binary.LittleEndian.PutUint32(inode.Block[off+8:], ext.physical)
+			writeExtentToBuffer(inode.Block[:], 12+i*12, ext)
 		}
-
 		return nil
 	}
 
-	// Need extent tree - allocate leaf block
-	leafBlock, err := b.allocateBlock()
+	return b.writeExtentTree(inode, extents)
+}
+
+// writeExtentTree creates an indexed extent tree for files with many extents.
+func (b *builder) writeExtentTree(inode *inode, extents []extent) error {
+	const maxIndexEntries = 4
+	const maxTotalExtents = maxExtentsPerLeaf * maxIndexEntries // 1360
+
+	if len(extents) > maxTotalExtents {
+		return fmt.Errorf("too many extents (%d): maximum supported is %d", len(extents), maxTotalExtents)
+	}
+
+	numLeaves := (len(extents) + maxExtentsPerLeaf - 1) / maxExtentsPerLeaf
+
+	leafBlocks, err := b.allocateLeafBlocks(numLeaves)
 	if err != nil {
 		return err
 	}
 
-	leaf := make([]byte, blockSize)
-
-	// Write extent header for leaf
-	binary.LittleEndian.PutUint16(leaf[0:2], extentMagic)
-	binary.LittleEndian.PutUint16(leaf[2:4], uint16(len(extents)))
-	binary.LittleEndian.PutUint16(leaf[4:6], (blockSize-12)/12) // max entries
-	binary.LittleEndian.PutUint16(leaf[6:8], 0)                 // depth 0
-
-	// Write extents to leaf
-	for i, ext := range extents {
-		off := 12 + i*12
-		binary.LittleEndian.PutUint32(leaf[off:], ext.logical)
-		binary.LittleEndian.PutUint16(leaf[off+4:], ext.length)
-		binary.LittleEndian.PutUint16(leaf[off+6:], 0)
-		binary.LittleEndian.PutUint32(leaf[off+8:], ext.physical)
+	if err := b.writeExtentLeaves(leafBlocks, extents); err != nil {
+		return err
 	}
 
-	if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
-		return fmt.Errorf("failed to write extent leaf block: %w", err)
-	}
+	b.setupIndexNode(inode, leafBlocks, extents, numLeaves)
 
-	// Update inode to be index node
+	return nil
+}
+
+// allocateLeafBlocks allocates the specified number of blocks for extent leaves.
+func (b *builder) allocateLeafBlocks(count int) ([]uint32, error) {
+	blocks := make([]uint32, count)
+	for i := 0; i < count; i++ {
+		block, err := b.allocateBlock()
+		if err != nil {
+			return nil, fmt.Errorf("failed to allocate extent leaf block %d: %w", i, err)
+		}
+		blocks[i] = block
+	}
+	return blocks, nil
+}
+
+// writeExtentLeaves writes extent data to the allocated leaf blocks.
+func (b *builder) writeExtentLeaves(leafBlocks []uint32, extents []extent) error {
+	for leafIdx, leafBlock := range leafBlocks {
+		startIdx := leafIdx * maxExtentsPerLeaf
+		endIdx := startIdx + maxExtentsPerLeaf
+		if endIdx > len(extents) {
+			endIdx = len(extents)
+		}
+		leafExtents := extents[startIdx:endIdx]
+
+		leaf := make([]byte, blockSize)
+		binary.LittleEndian.PutUint16(leaf[0:2], extentMagic)
+		binary.LittleEndian.PutUint16(leaf[2:4], uint16(len(leafExtents)))
+		binary.LittleEndian.PutUint16(leaf[4:6], maxExtentsPerLeaf)
+		binary.LittleEndian.PutUint16(leaf[6:8], 0) // depth 0
+
+		for i, ext := range leafExtents {
+			writeExtentToBuffer(leaf, 12+i*12, ext)
+		}
+
+		if err := b.disk.writeAt(leaf, int64(b.layout.BlockOffset(leafBlock))); err != nil {
+			return fmt.Errorf("failed to write extent leaf block %d: %w", leafIdx, err)
+		}
+	}
+	return nil
+}
+
+// setupIndexNode configures the inode as an extent index node pointing to leaf blocks.
+func (b *builder) setupIndexNode(inode *inode, leafBlocks []uint32, extents []extent, numLeaves int) {
 	for i := range inode.Block {
 		inode.Block[i] = 0
 	}
 
 	binary.LittleEndian.PutUint16(inode.Block[0:2], extentMagic)
-	binary.LittleEndian.PutUint16(inode.Block[2:4], 1) // 1 index entry
-	binary.LittleEndian.PutUint16(inode.Block[4:6], 4) // max entries
+	binary.LittleEndian.PutUint16(inode.Block[2:4], uint16(numLeaves))
+	binary.LittleEndian.PutUint16(inode.Block[4:6], 4) // max index entries
 	binary.LittleEndian.PutUint16(inode.Block[6:8], 1) // depth 1
 
-	// Write index entry pointing to leaf
-	binary.LittleEndian.PutUint32(inode.Block[12:16], 0)         // first logical block
-	binary.LittleEndian.PutUint32(inode.Block[16:20], leafBlock) // leaf block lo
-	binary.LittleEndian.PutUint16(inode.Block[20:22], 0)         // leaf block hi
+	for i, leafBlock := range leafBlocks {
+		off := 12 + i*12
+		firstLogical := extents[i*maxExtentsPerLeaf].logical
+		binary.LittleEndian.PutUint32(inode.Block[off:], firstLogical)
+		binary.LittleEndian.PutUint32(inode.Block[off+4:], leafBlock)
+		binary.LittleEndian.PutUint16(inode.Block[off+8:], 0)
+	}
 
-	// Account for the leaf block in inode's block count
-	inode.BlocksLo += blockSize / 512
-
-	return nil
+	inode.BlocksLo += uint32(numLeaves) * (blockSize / 512)
 }
 
 // writeInode writes an inode structure to its designated location in the inode table.

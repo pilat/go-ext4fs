@@ -8,6 +8,7 @@ Pure Go ext4 filesystem implementation for creating disk images without external
 [![Go Version](https://img.shields.io/github/go-mod/go-version/pilat/go-ext4fs)](https://github.com/pilat/go-ext4fs)
 [![CI](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml/badge.svg)](https://github.com/pilat/go-ext4fs/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/github/pilat/go-ext4fs/graph/badge.svg)](https://codecov.io/github/pilat/go-ext4fs)
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/pilat/go-ext4fs?utm_source=oss&utm_medium=github&utm_campaign=pilat%2Fgo-ext4fs&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 
 ## Overview
 
