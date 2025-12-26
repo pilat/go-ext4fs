@@ -139,22 +139,38 @@ func (b *builder) allocateBlocks(n uint32) ([]uint32, error) {
 	return blocks, nil
 }
 
-// allocateInode allocates the next available inode number from the global sequence.
-// Inodes are allocated sequentially starting from FirstNonResInode (11).
+// allocateInode allocates the next available inode number.
+// It first tries to reuse freed inodes, then allocates sequentially.
 // Returns the allocated inode number or an error if no inodes are available.
 func (b *builder) allocateInode() (uint32, error) {
+	// First, try to reuse a freed inode
+	if len(b.freeInodeList) > 0 {
+		inodeNum := b.freeInodeList[len(b.freeInodeList)-1]
+		b.freeInodeList = b.freeInodeList[:len(b.freeInodeList)-1]
+
+		group := (inodeNum - 1) / inodesPerGroup
+		b.freedInodesPerGroup[group]--
+
+		if err := b.markInodeUsed(inodeNum); err != nil {
+			return 0, fmt.Errorf("failed to mark reused inode as used: %w", err)
+		}
+
+		return inodeNum, nil
+	}
+
+	// Otherwise allocate new inode
 	if b.nextInode > b.layout.TotalInodes() {
 		return 0, fmt.Errorf("out of inodes: %d", b.nextInode)
 	}
 
-	inode := b.nextInode
+	inodeNum := b.nextInode
 
 	b.nextInode++
-	if err := b.markInodeUsed(inode); err != nil {
+	if err := b.markInodeUsed(inodeNum); err != nil {
 		return 0, fmt.Errorf("failed to mark allocated inode as used: %w", err)
 	}
 
-	return inode, nil
+	return inodeNum, nil
 }
 
 // markBlockUsed marks the specified block as used in its group's block bitmap.
@@ -204,8 +220,9 @@ func (b *builder) freeInode(inodeNum uint32) error {
 		return fmt.Errorf("failed to write inode bitmap for freeing inode %d: %w", inodeNum, err)
 	}
 
-	// Track freed inodes for accurate count
+	// Track freed inodes for accurate count and reuse
 	b.freedInodesPerGroup[group]++
+	b.freeInodeList = append(b.freeInodeList, inodeNum)
 
 	return nil
 }

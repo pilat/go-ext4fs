@@ -136,6 +136,7 @@ func TestExt4FS(t *testing.T) {
 		{"ExtentTreeConversion", testExtentTreeConversion},
 		{"DirectoryExtentTree", testDirectoryExtentTree},
 		{"ExtentTreeLeafAllocation", testExtentTreeLeafAllocation},
+		{"ExtentTreeManyExtents", testExtentTreeManyExtents},
 		{"XattrBasic", testXattrBasic},
 		{"XattrSELinux", testXattrSELinux},
 		{"XattrMultiple", testXattrMultiple},
@@ -168,6 +169,7 @@ func TestExt4FS(t *testing.T) {
 		{"DeleteDotDotFails", testDeleteDotDotFails},
 		{"DeleteFirstEntry", testDeleteFirstEntry},
 		{"DeleteStressTest", testDeleteStressTest},
+		{"InodeReuse", testInodeReuse},
 	}
 
 	for _, tc := range tests {
@@ -1092,6 +1094,51 @@ func testExtentTreeLeafAllocation(t *testing.T) {
 	assert.Contains(t, output, "small")
 	assert.Contains(t, output, fmt.Sprintf("%d", 20*4096))
 }
+
+// testExtentTreeManyExtents tests file creation with more than 340 extents.
+// This exercises the multi-leaf extent tree code path where extents must be
+// split across multiple leaf blocks (max 340 extents per leaf).
+func testExtentTreeManyExtents(t *testing.T) {
+	env := newTestEnv(t, 256) // Larger image to have enough space
+
+	// Create 700 single-block files to allocate blocks
+	for i := 0; i < 700; i++ {
+		content := []byte(fmt.Sprintf("file %d content", i))
+		_, err := env.builder.CreateFile(ext4fs.RootInode, fmt.Sprintf("frag_%04d.txt", i), content, 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Delete every other file to create fragmentation
+	// This leaves gaps in the block allocation that will be reused
+	for i := 0; i < 700; i += 2 {
+		err := env.builder.Delete(ext4fs.RootInode, fmt.Sprintf("frag_%04d.txt", i))
+		require.NoError(t, err)
+	}
+
+	// Create a large file that requires 350+ blocks
+	// With fragmentation, each freed block becomes a separate extent
+	// 350 extents > 340 max per leaf, triggering multi-leaf extent tree
+	largeContent := make([]byte, 350*4096)
+	for i := range largeContent {
+		largeContent[i] = byte(i % 256)
+	}
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "fragmented_large.bin", largeContent, 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "fragmented_large.bin" && echo "file exists"`,
+		`stat -c "%s" "fragmented_large.bin"`,
+		`md5sum "fragmented_large.bin" | cut -d' ' -f1`,
+	)
+
+	assert.Contains(t, output, "file exists")
+	assert.Contains(t, output, fmt.Sprintf("%d", 350*4096))
+	// Verify data integrity - content is deterministic: byte(i % 256)
+	assert.Contains(t, output, "927be24bf1e37fc370e57d3d25ee929b")
+}
+
 func testDirectoryExtentTree(t *testing.T) {
 	env := newTestEnv(t, 128)
 
@@ -2101,6 +2148,106 @@ func testDeleteStressTest(t *testing.T) {
 	assert.Contains(t, output, "200") // All new_* files should exist
 	assert.Contains(t, output, "new content 0")
 	assert.Contains(t, output, "new content 199")
+}
+
+// testInodeReuse verifies that freed inodes are properly reused when creating new files.
+// This catches a bug where allocateInode only increments nextInode but never reuses
+// freed inodes from the freeInodeList.
+func testInodeReuse(t *testing.T) {
+	env := newTestEnv(t, 64)
+
+	// Phase 1: Create files and verify sequential allocation
+	inode1, err := env.builder.CreateFile(ext4fs.RootInode, "file1.txt", []byte("content1"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	inode2, err := env.builder.CreateFile(ext4fs.RootInode, "file2.txt", []byte("content2"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	inode3, err := env.builder.CreateFile(ext4fs.RootInode, "file3.txt", []byte("content3"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	inode4, err := env.builder.CreateFile(ext4fs.RootInode, "file4.txt", []byte("content4"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	require.Equal(t, inode1+1, inode2, "initial inodes should be sequential")
+	require.Equal(t, inode2+1, inode3, "initial inodes should be sequential")
+	require.Equal(t, inode3+1, inode4, "initial inodes should be sequential")
+
+	// Phase 2: Delete multiple files to test LIFO reuse order
+	// Delete in order: file2, file4 -> freeInodeList = [inode2, inode4]
+	err = env.builder.Delete(ext4fs.RootInode, "file2.txt")
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "file4.txt")
+	require.NoError(t, err)
+
+	// Phase 3: Create new files - should reuse in LIFO order (inode4 first, then inode2)
+	newA, err := env.builder.CreateFile(ext4fs.RootInode, "new_a.txt", []byte("new_a"), 0644, 0, 0)
+	require.NoError(t, err)
+	require.Equalf(t, inode4, newA, "first reuse should get inode4 (LIFO): expected %d, got %d", inode4, newA)
+
+	newB, err := env.builder.CreateFile(ext4fs.RootInode, "new_b.txt", []byte("new_b"), 0644, 0, 0)
+	require.NoError(t, err)
+	require.Equalf(t, inode2, newB, "second reuse should get inode2 (LIFO): expected %d, got %d", inode2, newB)
+
+	// Phase 4: No more freed inodes - should allocate new one (inode5 = inode4 + 1)
+	newC, err := env.builder.CreateFile(ext4fs.RootInode, "new_c.txt", []byte("new_c"), 0644, 0, 0)
+	require.NoError(t, err)
+	expectedNew := inode4 + 1
+	require.Equalf(t, expectedNew, newC, "after exhausting freed inodes, should allocate new: expected %d, got %d", expectedNew, newC)
+
+	// Phase 5: Test directory inode reuse
+	dir1, err := env.builder.CreateDirectory(ext4fs.RootInode, "dir1", 0755, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "dir1")
+	require.NoError(t, err)
+
+	dir2, err := env.builder.CreateDirectory(ext4fs.RootInode, "dir2", 0755, 0, 0)
+	require.NoError(t, err)
+	require.Equalf(t, dir1, dir2, "directory inode should be reused: expected %d, got %d", dir1, dir2)
+
+	// Phase 6: Test symlink inode reuse
+	sym1, err := env.builder.CreateSymlink(ext4fs.RootInode, "sym1", "file1.txt", 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "sym1")
+	require.NoError(t, err)
+
+	sym2, err := env.builder.CreateSymlink(ext4fs.RootInode, "sym2", "file3.txt", 0, 0)
+	require.NoError(t, err)
+	require.Equalf(t, sym1, sym2, "symlink inode should be reused: expected %d, got %d", sym1, sym2)
+
+	env.finalize()
+
+	// Phase 7: Verify with Linux kernel - check inode numbers match
+	output := env.dockerExecSimple(
+		`stat -c "%i" file1.txt`,
+		`stat -c "%i" file3.txt`,
+		`stat -c "%i" new_a.txt`,
+		`stat -c "%i" new_b.txt`,
+		`stat -c "%i" new_c.txt`,
+		`stat -c "%i" dir2`,
+		`stat -c "%i" sym2`,
+		// Verify files are readable
+		`cat new_a.txt`,
+		`cat new_b.txt`,
+		`cat new_c.txt`,
+	)
+
+	// Verify inodes match what we recorded
+	assert.Contains(t, output, fmt.Sprintf("%d", inode1))
+	assert.Contains(t, output, fmt.Sprintf("%d", inode3))
+	assert.Contains(t, output, fmt.Sprintf("%d", newA))
+	assert.Contains(t, output, fmt.Sprintf("%d", newB))
+	assert.Contains(t, output, fmt.Sprintf("%d", newC))
+	assert.Contains(t, output, fmt.Sprintf("%d", dir2))
+	assert.Contains(t, output, fmt.Sprintf("%d", sym2))
+
+	// Verify content is correct (not corrupted by inode reuse)
+	assert.Contains(t, output, "new_a")
+	assert.Contains(t, output, "new_b")
+	assert.Contains(t, output, "new_c")
 }
 
 // =============================================================================
