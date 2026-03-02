@@ -176,6 +176,18 @@ func TestExt4FS(t *testing.T) {
 		{"OpenAndDeleteFile", testOpenAndDeleteFile},
 		{"OpenInvalidImage", testOpenInvalidImage},
 		{"LargeFileAfterDeletes", testLargeFileAfterDeletes},
+		{"HardlinkToDirectory", testHardlinkToDirectory},
+		{"HardlinkExistingName", testHardlinkExistingName},
+		{"HardlinkInvalidName", testHardlinkInvalidName},
+		{"HardlinkNonExistentInode", testHardlinkNonExistentInode},
+		{"HardlinkBasic", testHardlinkBasic},
+		{"HardlinkDeleteOne", testHardlinkDeleteOne},
+		{"HardlinkDeleteAll", testHardlinkDeleteAll},
+		{"HardlinkToSymlink", testHardlinkToSymlink},
+		{"HardlinkMultiple", testHardlinkMultiple},
+		{"HardlinkOverwrite", testHardlinkOverwrite},
+		{"HardlinkDeleteDirectoryExternal", testHardlinkDeleteDirectoryExternal},
+		{"HardlinkDeleteDirectoryInternal", testHardlinkDeleteDirectoryInternal},
 	}
 
 	for _, tc := range tests {
@@ -2497,6 +2509,306 @@ func testLargeFileAfterDeletes(t *testing.T) {
 
 	expectedSize := fmt.Sprintf("%d", numFiles*4096)
 	assert.Contains(t, output, expectedSize, "large file should have correct size")
+}
+
+// =============================================================================
+// Hardlink Tests — Validation (no Docker needed)
+// =============================================================================
+
+func testHardlinkToDirectory(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "mydir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link_to_dir", dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "directories are not allowed")
+
+	env.finalize()
+
+	// Verify the rejected link didn't corrupt the image
+	env.dockerExecSimple(`test -d "mydir" && echo "dir ok"`)
+}
+
+func testHardlinkExistingName(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "file.txt", []byte("hello"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "file.txt", inode)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already exists")
+
+	env.finalize()
+
+	// Verify the file is intact after the rejected link
+	output := env.dockerExecSimple(`cat file.txt`)
+	assert.Contains(t, output, "hello")
+}
+
+func testHardlinkInvalidName(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "file.txt", []byte("hello"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	for _, name := range []string{"", ".", ".."} {
+		err = env.builder.Link(ext4fs.RootInode, name, inode)
+		assert.Error(t, err, "expected error for name %q", name)
+	}
+
+	env.finalize()
+
+	// Verify the image is valid after all rejected links
+	output := env.dockerExecSimple(`cat file.txt`)
+	assert.Contains(t, output, "hello")
+}
+
+func testHardlinkNonExistentInode(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	err := env.builder.Link(ext4fs.RootInode, "link", 99999)
+	require.Error(t, err)
+
+	env.finalize()
+
+	// Verify the image passes e2fsck after the rejected link
+	env.dockerExecSimple(`ls /`)
+}
+
+// =============================================================================
+// Hardlink Tests — E2E (Docker validation)
+// =============================================================================
+
+func testHardlinkBasic(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "original.txt", []byte("shared content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link.txt", inode)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`cat original.txt`,
+		`cat link.txt`,
+		`ORIG=$(stat -c "%i" original.txt) && LINK=$(stat -c "%i" link.txt) && test "$ORIG" = "$LINK" && echo "INODE_MATCH"`,
+		`stat -c "LINKCOUNT=%h" original.txt`,
+	)
+
+	assert.Contains(t, output, "shared content")
+	assert.Contains(t, output, "INODE_MATCH")
+	assert.Contains(t, output, "LINKCOUNT=2")
+}
+
+func testHardlinkDeleteOne(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "original.txt", []byte("survive delete"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link.txt", inode)
+	require.NoError(t, err)
+
+	err = env.builder.Delete(ext4fs.RootInode, "original.txt")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "original.txt" && echo "original exists" || echo "original deleted"`,
+		`cat link.txt`,
+		`stat -c "LINKCOUNT=%h" link.txt`,
+	)
+
+	assert.Contains(t, output, "original deleted")
+	assert.Contains(t, output, "survive delete")
+	assert.Contains(t, output, "LINKCOUNT=1")
+}
+
+func testHardlinkDeleteAll(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "file.txt", []byte("will be freed"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link1.txt", inode)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link2.txt", inode)
+	require.NoError(t, err)
+
+	// Delete all three names
+	err = env.builder.Delete(ext4fs.RootInode, "file.txt")
+	require.NoError(t, err)
+	err = env.builder.Delete(ext4fs.RootInode, "link1.txt")
+	require.NoError(t, err)
+	err = env.builder.Delete(ext4fs.RootInode, "link2.txt")
+	require.NoError(t, err)
+
+	// Create a new file to confirm blocks were freed (no corruption)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "new_file.txt", []byte("after cleanup"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -f "file.txt" && echo "file exists" || echo "file deleted"`,
+		`test -f "link1.txt" && echo "link1 exists" || echo "link1 deleted"`,
+		`test -f "link2.txt" && echo "link2 exists" || echo "link2 deleted"`,
+		`cat new_file.txt`,
+	)
+
+	assert.Contains(t, output, "file deleted")
+	assert.Contains(t, output, "link1 deleted")
+	assert.Contains(t, output, "link2 deleted")
+	assert.Contains(t, output, "after cleanup")
+}
+
+func testHardlinkToSymlink(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "target.txt", []byte("target content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	symlinkInode, err := env.builder.CreateSymlink(ext4fs.RootInode, "sym.txt", "target.txt", 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "hardlink_to_sym.txt", symlinkInode)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`echo "SYM_TARGET=$(readlink sym.txt)"`,
+		`echo "HARDLINK_TARGET=$(readlink hardlink_to_sym.txt)"`,
+		`ORIG=$(stat -c "%i" sym.txt) && LINK=$(stat -c "%i" hardlink_to_sym.txt) && test "$ORIG" = "$LINK" && echo "INODE_MATCH"`,
+	)
+
+	assert.Contains(t, output, "SYM_TARGET=target.txt")
+	assert.Contains(t, output, "HARDLINK_TARGET=target.txt")
+	assert.Contains(t, output, "INODE_MATCH")
+}
+
+func testHardlinkMultiple(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "source.txt", []byte("multi-link"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	for i := 1; i <= 3; i++ {
+		err = env.builder.Link(ext4fs.RootInode, fmt.Sprintf("link_%d.txt", i), inode)
+		require.NoError(t, err)
+	}
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`stat -c "LINKCOUNT=%h" source.txt`,
+		`S=$(stat -c "%i" source.txt) && for f in link_1.txt link_2.txt link_3.txt; do L=$(stat -c "%i" "$f"); test "$S" = "$L" || { echo "MISMATCH $f"; exit 1; }; done && echo "ALL_INODES_MATCH"`,
+		`cat link_3.txt`,
+	)
+
+	assert.Contains(t, output, "LINKCOUNT=4")
+	assert.Contains(t, output, "ALL_INODES_MATCH")
+	assert.Contains(t, output, "multi-link")
+}
+
+func testHardlinkOverwrite(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create file, hardlink it, then overwrite original via CreateFile
+	inode, err := env.builder.CreateFile(ext4fs.RootInode, "a.txt", []byte("original"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "b.txt", inode)
+	require.NoError(t, err)
+
+	// Overwrite a.txt — should update the shared inode in-place (like O_TRUNC)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "a.txt", []byte("updated content"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`cat a.txt`,
+		`cat b.txt`,
+		`stat -c "LINKCOUNT=%h" a.txt`,
+		`ORIG=$(stat -c "%i" a.txt) && LINK=$(stat -c "%i" b.txt) && test "$ORIG" = "$LINK" && echo "INODE_MATCH"`,
+	)
+
+	// Both names should see the updated content (same inode, in-place overwrite)
+	assert.Contains(t, output, "updated content")
+	// Link count must still be 2
+	assert.Contains(t, output, "LINKCOUNT=2")
+	// Same inode number
+	assert.Contains(t, output, "INODE_MATCH")
+}
+
+func testHardlinkDeleteDirectoryExternal(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Create /dir/file.txt with a hardlink at /link.txt (outside the dir)
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "dir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	inode, err := env.builder.CreateFile(dir, "file.txt", []byte("survive rm -rf"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(ext4fs.RootInode, "link.txt", inode)
+	require.NoError(t, err)
+
+	// rm -rf /dir — should unlink dir/file.txt (count 2→1), link.txt survives
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "dir")
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "dir" && echo "dir exists" || echo "dir deleted"`,
+		`cat link.txt`,
+		`stat -c "LINKCOUNT=%h" link.txt`,
+	)
+
+	assert.Contains(t, output, "dir deleted")
+	assert.Contains(t, output, "survive rm -rf")
+	assert.Contains(t, output, "LINKCOUNT=1")
+}
+
+func testHardlinkDeleteDirectoryInternal(t *testing.T) {
+	env := newTestEnv(t, defaultImageSizeMB)
+
+	// Two names inside the same directory pointing to the same inode
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "dir", 0755, 0, 0)
+	require.NoError(t, err)
+
+	inode, err := env.builder.CreateFile(dir, "a.txt", []byte("shared data"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	err = env.builder.Link(dir, "b.txt", inode)
+	require.NoError(t, err)
+
+	// rm -rf /dir — unlinkFile called twice for the same inode (count 2→1→0, then freed)
+	err = env.builder.DeleteDirectory(ext4fs.RootInode, "dir")
+	require.NoError(t, err)
+
+	// Verify no corruption by creating a new file
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "clean.txt", []byte("all good"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`test -d "dir" && echo "dir exists" || echo "dir deleted"`,
+		`cat clean.txt`,
+	)
+
+	assert.Contains(t, output, "dir deleted")
+	assert.Contains(t, output, "all good")
 }
 
 // =============================================================================

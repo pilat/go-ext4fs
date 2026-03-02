@@ -24,6 +24,28 @@ func isSparseGroup(group uint32) bool {
 	return false
 }
 
+// modeToFileType converts an inode mode to a directory entry file type.
+func modeToFileType(mode uint16) uint8 {
+	switch mode & 0xF000 {
+	case s_IFDIR:
+		return ftDir
+	case s_IFREG:
+		return ftRegFile
+	case s_IFLNK:
+		return ftSymlink
+	case s_IFCHR:
+		return ftChrDev
+	case s_IFBLK:
+		return ftBlkDev
+	case s_IFIFO:
+		return ftFifo
+	case s_IFSOCK:
+		return ftSock
+	default:
+		return ftUnknown
+	}
+}
+
 // validateName checks if a filename is valid for use in an ext4 filesystem.
 // Enforces ext4 naming restrictions including length limits, forbidden characters,
 // and reserved names. Used before creating files or directories.

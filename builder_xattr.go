@@ -141,11 +141,14 @@ func (b *builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 		return 0, fmt.Errorf("failed to read inode for overwrite: %w", err)
 	}
 
+	linksCount := oldInode.LinksCount
+
 	if err := b.freeOldFileResources(oldInode); err != nil {
 		return 0, err
 	}
 
 	inode := b.makeFileInode(mode, uid, gid, uint64(len(content)))
+	inode.LinksCount = linksCount
 
 	inode, _, err = b.allocateAndWriteFileContent(inode, content)
 	if err != nil {
