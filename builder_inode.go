@@ -267,6 +267,9 @@ func (b *builder) incrementLinkCount(inodeNum uint32) error {
 		return fmt.Errorf("failed to read inode for link count increment: %w", err)
 	}
 
+	if inode.LinksCount >= 65000 {
+		return fmt.Errorf("too many links to inode %d (maximum 65000)", inodeNum)
+	}
 	inode.LinksCount++
 	if err := b.writeInode(inodeNum, inode); err != nil {
 		return fmt.Errorf("failed to write inode after incrementing link count: %w", err)

@@ -130,6 +130,12 @@ func (e *Image) CreateSymlink(parent uint32, name, target string, uid, gid uint1
 	return e.builder.createSymlink(parent, name, target, uid, gid)
 }
 
+// Link creates a hard link to an existing inode under the specified parent directory.
+// The target inode must not be a directory. Increments the target's link count.
+func (e *Image) Link(parent uint32, name string, targetInode uint32) error {
+	return e.builder.link(parent, name, targetInode)
+}
+
 // SetXattr sets an extended attribute on the specified inode.
 // Extended attributes use namespace prefixes like "user.", "trusted.", etc.
 // If the attribute already exists, its value is updated.

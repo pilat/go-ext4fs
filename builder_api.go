@@ -371,6 +371,55 @@ func (b *builder) createSymlink(parentInode uint32, name, target string, uid, gi
 	return inodeNum, nil
 }
 
+// link creates a hard link to an existing inode under the specified parent directory.
+// The target inode must exist and must not be a directory (ext4 forbids directory hardlinks).
+// Increments the target inode's link count and adds a new directory entry pointing to it.
+func (b *builder) link(parentInode uint32, name string, targetInode uint32) error {
+	if err := validateName(name); err != nil {
+		return fmt.Errorf("invalid link name: %w", err)
+	}
+
+	existingInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return fmt.Errorf("failed to check for existing entry: %w", err)
+	}
+	if existingInode != 0 {
+		return fmt.Errorf("entry %q already exists", name)
+	}
+
+	inode, err := b.readInode(targetInode)
+	if err != nil {
+		return fmt.Errorf("failed to read target inode: %w", err)
+	}
+	if inode.LinksCount == 0 {
+		return fmt.Errorf("target inode %d has link count 0 (freed or never allocated)", targetInode)
+	}
+	if (inode.Mode & 0xF000) == s_IFDIR {
+		return fmt.Errorf("hard links to directories are not allowed")
+	}
+
+	if err := b.incrementLinkCount(targetInode); err != nil {
+		return err
+	}
+
+	if err := b.addDirEntry(parentInode, dirEntry{
+		Inode: targetInode,
+		Type:  modeToFileType(inode.Mode),
+		Name:  []byte(name),
+	}); err != nil {
+		if _, decErr := b.decrementLinkCount(targetInode); decErr != nil {
+			return fmt.Errorf("failed to add directory entry: %v (rollback failed: %w)", err, decErr)
+		}
+		return fmt.Errorf("failed to add directory entry: %w", err)
+	}
+
+	if b.debug {
+		fmt.Printf("✓ Created hard link: %s -> inode %d\n", name, targetInode)
+	}
+
+	return nil
+}
+
 // freeInodeResources frees all resources associated with an inode (blocks, xattr, bitmap).
 func (b *builder) freeInodeResources(entryInode uint32, inode *inode) error {
 	if err := b.freeOldFileResources(inode); err != nil {
@@ -385,6 +434,61 @@ func (b *builder) freeInodeResources(entryInode uint32, inode *inode) error {
 
 	if err := b.freeInode(entryInode); err != nil {
 		return fmt.Errorf("failed to free inode: %w", err)
+	}
+
+	return nil
+}
+
+// deleteEmptyDir removes an empty directory entry and frees its resources.
+func (b *builder) deleteEmptyDir(parentInode, entryInode uint32, name string, inode *inode) error {
+	entries, err := b.listDirEntries(entryInode)
+	if err != nil {
+		return fmt.Errorf("failed to list directory entries: %w", err)
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("directory %q is not empty", name)
+	}
+
+	if err := b.removeDirEntry(parentInode, name); err != nil {
+		return fmt.Errorf("failed to remove directory entry: %w", err)
+	}
+
+	if err := b.freeInodeResources(entryInode, inode); err != nil {
+		return err
+	}
+
+	if _, err := b.decrementLinkCount(parentInode); err != nil {
+		return fmt.Errorf("failed to decrement parent link count: %w", err)
+	}
+
+	group := (entryInode - 1) / inodesPerGroup
+	if b.usedDirsPerGroup[group] > 0 {
+		b.usedDirsPerGroup[group]--
+	}
+
+	return nil
+}
+
+// unlinkFile removes a directory entry for a non-directory inode.
+// Frees inode resources only when the link count reaches zero.
+func (b *builder) unlinkFile(parentInode, entryInode uint32, name string) error {
+	if err := b.removeDirEntry(parentInode, name); err != nil {
+		return fmt.Errorf("failed to remove directory entry: %w", err)
+	}
+
+	count, err := b.decrementLinkCount(entryInode)
+	if err != nil {
+		return fmt.Errorf("failed to decrement link count: %w", err)
+	}
+
+	if count == 0 {
+		inode, err := b.readInode(entryInode)
+		if err != nil {
+			return fmt.Errorf("failed to read inode for cleanup: %w", err)
+		}
+		if err := b.freeInodeResources(entryInode, inode); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -411,32 +515,13 @@ func (b *builder) deleteEntry(parentInode uint32, name string) error {
 		return fmt.Errorf("failed to read entry inode: %w", err)
 	}
 
-	isDir := (inode.Mode & s_IFDIR) != 0
-	if isDir {
-		entries, err := b.listDirEntries(entryInode)
-		if err != nil {
-			return fmt.Errorf("failed to list directory entries: %w", err)
+	if (inode.Mode & 0xF000) == s_IFDIR {
+		if err := b.deleteEmptyDir(parentInode, entryInode, name, inode); err != nil {
+			return err
 		}
-		if len(entries) > 0 {
-			return fmt.Errorf("directory %q is not empty", name)
-		}
-	}
-
-	if err := b.freeInodeResources(entryInode, inode); err != nil {
-		return err
-	}
-
-	if err := b.removeDirEntry(parentInode, name); err != nil {
-		return fmt.Errorf("failed to remove directory entry: %w", err)
-	}
-
-	if isDir {
-		if _, err := b.decrementLinkCount(parentInode); err != nil {
-			return fmt.Errorf("failed to decrement parent link count: %w", err)
-		}
-		group := (entryInode - 1) / inodesPerGroup
-		if b.usedDirsPerGroup[group] > 0 {
-			b.usedDirsPerGroup[group]--
+	} else {
+		if err := b.unlinkFile(parentInode, entryInode, name); err != nil {
+			return err
 		}
 	}
 
