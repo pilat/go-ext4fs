@@ -10,8 +10,14 @@ type memoryBackend struct {
 
 var _ diskBackend = (*memoryBackend)(nil)
 
+// truncate resizes the in-memory buffer to size, preserving existing data like
+// os.File.Truncate: growing zero-fills the new tail, shrinking keeps the prefix.
+// In New the old buffer is nil, so the copy is a no-op and the result is a fresh
+// zeroed slice; Resize relies on the preserve semantics.
 func (m *memoryBackend) truncate(size int64) error {
-	m.data = make([]byte, size)
+	newData := make([]byte, size)
+	copy(newData, m.data)
+	m.data = newData
 	return nil
 }
 

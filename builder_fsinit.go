@@ -55,7 +55,7 @@ func (b *builder) writeSuperblock() error {
 	sb.UUID[6] = (sb.UUID[6] & 0x0F) | 0x40 // Version 4
 	sb.UUID[8] = (sb.UUID[8] & 0x3F) | 0x80 // Variant RFC 4122
 
-	copy(sb.VolumeName[:], "ext4-go")
+	copy(sb.VolumeName[:], b.label)
 
 	for i := 0; i < 4; i++ {
 		sb.HashSeed[i] = b.layout.CreatedAt + uint32(i*0x12345678)
@@ -97,6 +97,33 @@ func (b *builder) writeSuperblock() error {
 	return nil
 }
 
+// groupDescriptorFor builds the on-disk group descriptor for a single block
+// group from the current layout. It captures the structural fields (bitmap and
+// inode-table locations) plus the initial free counts; the free counts are later
+// recomputed by finalizeMetadata. Shared by writeGroupDescriptors (New) and the
+// grow path so both produce byte-identical descriptors.
+func (b *builder) groupDescriptorFor(g uint32) groupDesc32 {
+	gl := b.layout.GetGroupLayout(g)
+
+	freeBlocks := gl.BlocksInGroup - gl.OverheadBlocks
+
+	freeInodes := uint16(inodesPerGroup)
+	if g == 0 {
+		freeInodes = uint16(inodesPerGroup - (firstNonResInode - 1))
+	}
+
+	return groupDesc32{
+		BlockBitmapLo:     gl.BlockBitmapBlock,
+		InodeBitmapLo:     gl.InodeBitmapBlock,
+		InodeTableLo:      gl.InodeTableStart,
+		FreeBlocksCountLo: uint16(freeBlocks),
+		FreeInodesCountLo: freeInodes,
+		UsedDirsCountLo:   0,
+		Flags:             0, // Don't set BGInodeZeroed without metadata_csum
+		ItableUnusedLo:    freeInodes,
+	}
+}
+
 // writeGroupDescriptors writes the group descriptor table (GDT) after the superblock.
 // Each group descriptor (32 bytes) contains metadata for its block group including
 // locations of bitmaps, inode tables, and usage statistics. The GDT enables
@@ -105,25 +132,7 @@ func (b *builder) writeGroupDescriptors() error {
 	gdt := make([]byte, b.layout.GroupCount*32)
 
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-
-		freeBlocks := gl.BlocksInGroup - gl.OverheadBlocks
-
-		freeInodes := uint16(inodesPerGroup)
-		if g == 0 {
-			freeInodes = uint16(inodesPerGroup - (firstNonResInode - 1))
-		}
-
-		gd := groupDesc32{
-			BlockBitmapLo:     gl.BlockBitmapBlock,
-			InodeBitmapLo:     gl.InodeBitmapBlock,
-			InodeTableLo:      gl.InodeTableStart,
-			FreeBlocksCountLo: uint16(freeBlocks),
-			FreeInodesCountLo: freeInodes,
-			UsedDirsCountLo:   0,
-			Flags:             0, // Don't set BGInodeZeroed without metadata_csum
-			ItableUnusedLo:    freeInodes,
-		}
+		gd := b.groupDescriptorFor(g)
 
 		var buf bytes.Buffer
 		if err := binary.Write(&buf, binary.LittleEndian, gd); err != nil {
@@ -159,50 +168,8 @@ func (b *builder) writeGroupDescriptors() error {
 // which inodes are in use. Reserved inodes (1-10) are marked as used during initialization.
 func (b *builder) initBitmaps() error {
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-
-		// Block bitmap
-		blockBitmap := make([]byte, blockSize)
-
-		// Mark overhead blocks as used
-		for i := uint32(0); i < gl.OverheadBlocks; i++ {
-			blockBitmap[i/8] |= 1 << (i % 8)
-		}
-
-		// Mark blocks beyond this group's range as used
-		for i := gl.BlocksInGroup; i < blocksPerGroup; i++ {
-			blockBitmap[i/8] |= 1 << (i % 8)
-		}
-
-		if err := b.disk.writeAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock))); err != nil {
-			return fmt.Errorf("failed to write block bitmap for group %d: %w", g, err)
-		}
-
-		// Inode bitmap
-		inodeBitmap := make([]byte, blockSize)
-
-		// Mark reserved inodes in group 0
-		if g == 0 {
-			for i := uint32(0); i < firstNonResInode-1; i++ {
-				inodeBitmap[i/8] |= 1 << (i % 8)
-			}
-		}
-
-		// Mark unused bits at end
-		usedBytes := (inodesPerGroup + 7) / 8
-		for i := usedBytes; i < blockSize; i++ {
-			inodeBitmap[i] = 0xFF
-		}
-
-		if inodesPerGroup%8 != 0 {
-			lastByte := usedBytes - 1
-			for bit := inodesPerGroup % 8; bit < 8; bit++ {
-				inodeBitmap[lastByte] |= 1 << bit
-			}
-		}
-
-		if err := b.disk.writeAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
-			return fmt.Errorf("failed to write inode bitmap for group %d: %w", g, err)
+		if err := b.initGroupBitmaps(g); err != nil {
+			return err
 		}
 	}
 
@@ -213,13 +180,77 @@ func (b *builder) initBitmaps() error {
 	return nil
 }
 
-// zeroInodeTables initializes all inode table blocks to zero.
-// Inode tables store the actual inode structures for each block group.
-// Zeroing ensures no garbage data remains from previous filesystem states.
-func (b *builder) zeroInodeTables() error {
+// initGroupBitmaps initializes the block and inode bitmaps for a single block
+// group. Overhead blocks and blocks beyond the (possibly partial) group range
+// are marked used in the block bitmap; reserved inodes (group 0 only) and the
+// padding past inodesPerGroup are marked used in the inode bitmap. Shared by
+// initBitmaps (New) and the grow path.
+func (b *builder) initGroupBitmaps(g uint32) error {
+	gl := b.layout.GetGroupLayout(g)
+
+	// Block bitmap
+	blockBitmap := make([]byte, blockSize)
+
+	// Mark overhead blocks as used
+	for i := uint32(0); i < gl.OverheadBlocks; i++ {
+		blockBitmap[i/8] |= 1 << (i % 8)
+	}
+
+	// Mark blocks beyond this group's range as used
+	for i := gl.BlocksInGroup; i < blocksPerGroup; i++ {
+		blockBitmap[i/8] |= 1 << (i % 8)
+	}
+
+	if err := b.disk.writeAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock))); err != nil {
+		return fmt.Errorf("failed to write block bitmap for group %d: %w", g, err)
+	}
+
+	// Inode bitmap
+	inodeBitmap := make([]byte, blockSize)
+
+	// Mark reserved inodes in group 0
+	if g == 0 {
+		for i := uint32(0); i < firstNonResInode-1; i++ {
+			inodeBitmap[i/8] |= 1 << (i % 8)
+		}
+	}
+
+	// Mark unused bits at end
+	usedBytes := (inodesPerGroup + 7) / 8
+	for i := usedBytes; i < blockSize; i++ {
+		inodeBitmap[i] = 0xFF
+	}
+
+	if inodesPerGroup%8 != 0 {
+		lastByte := usedBytes - 1
+		for bit := inodesPerGroup % 8; bit < 8; bit++ {
+			inodeBitmap[lastByte] |= 1 << bit
+		}
+	}
+
+	if err := b.disk.writeAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
+		return fmt.Errorf("failed to write inode bitmap for group %d: %w", g, err)
+	}
+
+	return nil
+}
+
+// zeroInodeTables zeroes the inode table blocks for groups [fromGroup, toGroup).
+// Inode tables store the actual inode structures for each block group; zeroing
+// ensures no garbage data remains from previous filesystem states.
+//
+// When skipZeroInit is set the region was just truncate-allocated and already
+// reads back as zero (sparse holes on the file backend, a zeroed slice in
+// memory), so the writes are pure waste and are skipped. The loop remains as a
+// safety fallback for any future path that initializes a non-fresh region.
+func (b *builder) zeroInodeTables(fromGroup, toGroup uint32) error {
+	if b.skipZeroInit {
+		return nil
+	}
+
 	zeroBlock := make([]byte, blockSize)
 
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
+	for g := fromGroup; g < toGroup; g++ {
 		gl := b.layout.GetGroupLayout(g)
 		for i := uint32(0); i < b.layout.InodeTableBlocks; i++ {
 			if err := b.disk.writeAt(zeroBlock, int64(b.layout.BlockOffset(gl.InodeTableStart+i))); err != nil {

@@ -70,6 +70,23 @@ func WithSize(sizeBytes uint64) ImageOption {
 	}
 }
 
+// WithLabel sets the ext4 volume label written to the superblock.
+// The label is what shows up at mount time. It must be at most 16 bytes
+// (the on-disk VolumeName field); a longer label returns an error rather than
+// being silently truncated, which would mount under an unexpected name.
+// When unset, the label defaults to "ext4-go".
+func WithLabel(label string) ImageOption {
+	return func(i *Image) error {
+		if len(label) > 16 {
+			return fmt.Errorf("label too long: %d bytes, max 16", len(label))
+		}
+
+		i.label = label
+
+		return nil
+	}
+}
+
 // WithCreatedAt sets the creation timestamp.
 func WithCreatedAt(createdAt uint32) ImageOption {
 	return func(i *Image) error {

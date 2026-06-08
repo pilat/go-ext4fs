@@ -17,6 +17,9 @@ type builder struct {
 	layout *Layout
 	debug  bool // Enable debug output
 
+	label        string // Volume label written to the superblock (New path only)
+	skipZeroInit bool   // Skip zeroing freshly-truncated inode tables (already zero)
+
 	// Allocation state - per group
 	nextBlockPerGroup   []uint32  // Next free block in each group
 	freedBlocksPerGroup []uint32  // Blocks freed per group (for overwrites)
@@ -37,6 +40,7 @@ func newBuilder(disk diskBackend, layout *Layout) *builder {
 		disk:                disk,
 		layout:              layout,
 		debug:               DEBUG,
+		label:               "ext4-go",
 		nextBlockPerGroup:   make([]uint32, layout.GroupCount),
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeRuns:            nil,
@@ -187,7 +191,7 @@ func (b *builder) prepareFilesystem() error {
 		return err
 	}
 
-	if err := b.zeroInodeTables(); err != nil {
+	if err := b.zeroInodeTables(0, b.layout.GroupCount); err != nil {
 		return err
 	}
 
