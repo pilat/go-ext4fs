@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,10 @@ const (
 
 	// Directory inside the Docker container where host images are mounted.
 	sharedContainerDir = "/ext4-images"
+
+	// ext4 geometry invariants, mirrored here for resize target math.
+	testBlockSize      = 4096
+	testBlocksPerGroup = 32768
 )
 
 // =============================================================================
@@ -188,6 +193,16 @@ func TestExt4FS(t *testing.T) {
 		{"HardlinkOverwrite", testHardlinkOverwrite},
 		{"HardlinkDeleteDirectoryExternal", testHardlinkDeleteDirectoryExternal},
 		{"HardlinkDeleteDirectoryInternal", testHardlinkDeleteDirectoryInternal},
+		{"VolumeLabel", testVolumeLabel},
+		{"ResizeShrink", testResizeShrink},
+		{"ResizeShrinkPartial", testResizeShrinkPartial},
+		{"ResizeShrinkSparseBoundary", testResizeShrinkSparseBoundary},
+		{"ResizeShrinkInodeBound", testResizeShrinkInodeBound},
+		{"ResizeGrow", testResizeGrow},
+		{"ResizeGrowMultiGroup", testResizeGrowMultiGroup},
+		{"ResizeGrowAfterShrink", testResizeGrowAfterShrink},
+		{"ResizeOpenGrow", testResizeOpenGrow},
+		{"ResizeOpenShrink", testResizeOpenShrink},
 	}
 
 	for _, tc := range tests {
@@ -2812,6 +2827,286 @@ func testHardlinkDeleteDirectoryInternal(t *testing.T) {
 }
 
 // =============================================================================
+// Volume Label & Resize Tests
+// =============================================================================
+
+// testVolumeLabel verifies a custom WithLabel survives to the mounted image and
+// is reported by dumpe2fs.
+func testVolumeLabel(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(defaultImageSizeMB), ext4fs.WithLabel("myvolume"))
+
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "marker.txt", []byte("labeled\n"), 0o644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	// Mount + e2fsck validate the image; dumpe2fs reads the label without mounting.
+	assert.Contains(t, env.dockerExecSimple(`cat marker.txt`), "labeled")
+	assert.Contains(t, env.dumpe2fsHeader(), "myvolume", "dumpe2fs should report the custom volume label")
+}
+
+// testResizeShrink builds a 16 GiB canvas (128 groups), fills it, then shrinks
+// to MinSize. The resulting image must be exactly MinSize, pass e2fsck, mount,
+// and preserve every entry.
+func testResizeShrink(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(16384), ext4fs.WithLabel("shrunk")) // 128 groups, 16 GiB
+
+	writeResizeFixture(t, env.builder)
+
+	minSize := env.builder.MinSize()
+	require.NoError(t, env.builder.Resize(minSize))
+	require.Equal(t, minSize, env.builder.Size())
+
+	env.finalize()
+
+	info, err := os.Stat(env.imagePath)
+	require.NoError(t, err)
+	assert.Equal(t, int64(minSize), info.Size(), "image file is exactly MinSize bytes")
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+	assert.Contains(t, env.dumpe2fsHeader(), "shrunk")
+}
+
+// testResizeShrinkPartial shrinks to a target well above MinSize whose new last
+// group is a non-sparse interior boundary (group 2), and confirms the kernel
+// sees the leftover space as free.
+func testResizeShrinkPartial(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(512)) // 4 groups
+
+	writeResizeFixture(t, env.builder)
+
+	// 3 groups, last group index 2 (not a sparse-super group), partial.
+	target := uint64(2*testBlocksPerGroup+10000) * testBlockSize
+	require.NoError(t, env.builder.Resize(target))
+	require.Equal(t, target, env.builder.Size())
+
+	env.finalize()
+
+	output := env.dockerExecSimple(append(verifyResizeFixtureCmds(),
+		`echo "AVAIL1K=$(df -k . | awk 'NR==2{print $4}')"`,
+	)...)
+	assertResizeFixture(t, output)
+	assert.Greater(t, parseLabeledInt(t, output, "AVAIL1K="), 100_000,
+		"partial shrink leaves substantial free space on the mounted filesystem")
+}
+
+// testResizeShrinkInodeBound creates enough empty files to spill inodes into a
+// higher group than any data block, then shrinks to MinSize. The new last group
+// holds inodes but no data, which the kernel must accept; all files survive.
+func testResizeShrinkInodeBound(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(256)) // 2 groups
+
+	const (
+		dirs   = 92
+		perDir = 90
+	)
+
+	want := 0
+	for d := 0; d < dirs; d++ {
+		dirInode, err := env.builder.CreateDirectory(ext4fs.RootInode, fmt.Sprintf("d%03d", d), 0o755, 0, 0)
+		require.NoError(t, err)
+
+		for f := 0; f < perDir; f++ {
+			_, err := env.builder.CreateFile(dirInode, fmt.Sprintf("f%03d", f), nil, 0o644, 0, 0)
+			require.NoError(t, err)
+			want++
+		}
+	}
+
+	// Inodes have spilled past group 0 (8192 inodes/group), so MinSize is bound
+	// by the inode group, not the data blocks.
+	minSize := env.builder.MinSize()
+	require.NoError(t, env.builder.Resize(minSize))
+	require.Equal(t, minSize, env.builder.Size())
+
+	env.finalize()
+
+	output := env.dockerExecSimple(`echo "FILECOUNT=$(find . -type f | wc -l)"`)
+	assert.Equal(t, want, parseLabeledInt(t, output, "FILECOUNT="), "all files survive the inode-bound shrink")
+}
+
+// testResizeShrinkSparseBoundary shrinks so the new last group is itself a
+// sparse-super group (group 9), exercising the backup-superblock rewrite at the
+// boundary.
+func testResizeShrinkSparseBoundary(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(2048)) // 16 groups
+
+	writeResizeFixture(t, env.builder)
+
+	// Target a size whose last group index is 9 (a sparse group): just past
+	// group 9's start, well above MinSize for the tiny fixture. This makes the
+	// new top group an even count of 10 groups with a partial, sparse last group.
+	target := uint64(9*testBlocksPerGroup+5000) * testBlockSize
+	require.NoError(t, env.builder.Resize(target))
+	require.Equal(t, target, env.builder.Size())
+
+	env.finalize()
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+}
+
+// testResizeGrow grows a single-group image across the first group boundary
+// (1 -> 2 groups), creating the sparse backup for group 1.
+func testResizeGrow(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(64), ext4fs.WithLabel("grown")) // 1 group
+
+	writeResizeFixture(t, env.builder)
+
+	require.NoError(t, env.builder.Resize(256*1024*1024)) // 2 groups
+	require.Equal(t, uint64(256*1024*1024), env.builder.Size())
+
+	env.finalize()
+
+	// Label via read-only dumpe2fs (no mount, no mutation).
+	assert.Contains(t, env.dumpe2fsHeader(), "grown")
+
+	// The grown space is usable: the kernel can write a 64 MiB file into it. This
+	// mutates the image, so it is the last operation on it (e2fsck runs before
+	// the write, validating the grown geometry).
+	output := env.dockerExecSimple(append(verifyResizeFixtureCmds(),
+		`dd if=/dev/zero of=grown.bin bs=1M count=64 2>/dev/null && echo GROW-WRITE-OK`,
+	)...)
+	assertResizeFixture(t, output)
+	assert.Contains(t, output, "GROW-WRITE-OK")
+}
+
+// testResizeGrowMultiGroup grows across several group boundaries (2 -> 8 groups),
+// adding new sparse-super groups (3, 5, 7).
+func testResizeGrowMultiGroup(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(256)) // 2 groups
+
+	writeResizeFixture(t, env.builder)
+
+	require.NoError(t, env.builder.Resize(1024*1024*1024)) // 8 groups
+
+	env.finalize()
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+}
+
+// testResizeGrowAfterShrink shrinks then grows in one build session, exercising
+// re-initialization of groups that were previously cut off.
+func testResizeGrowAfterShrink(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(256)) // 2 groups
+
+	writeResizeFixture(t, env.builder)
+
+	require.NoError(t, env.builder.Resize(env.builder.MinSize())) // shrink to 1 group
+	require.NoError(t, env.builder.Resize(256*1024*1024))         // grow back to 2 groups
+
+	env.finalize()
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+}
+
+// testResizeOpenGrow reopens a saved image and grows it, validating that resize
+// works identically on the Open path (state reconstructed from bitmaps).
+func testResizeOpenGrow(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(64), ext4fs.WithLabel("reopen")) // 1 group
+	writeResizeFixture(t, env.builder)
+	env.finalize()
+
+	reopened, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+	require.NoError(t, reopened.Resize(256*1024*1024)) // 2 groups
+	require.NoError(t, reopened.Save())
+	require.NoError(t, reopened.Close())
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+	assert.Contains(t, env.dumpe2fsHeader(), "reopen", "label preserved through Open+Resize")
+}
+
+// testResizeOpenShrink reopens a saved image and shrinks it, validating the
+// shrink path on the Open entry (state reconstructed from on-disk bitmaps).
+func testResizeOpenShrink(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithSizeInMB(256)) // 2 groups
+	writeResizeFixture(t, env.builder)
+	env.finalize()
+
+	reopened, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+	require.NoError(t, reopened.Resize(reopened.MinSize())) // collapse to 1 group
+	require.NoError(t, reopened.Save())
+	require.NoError(t, reopened.Close())
+
+	output := env.dockerExecSimple(verifyResizeFixtureCmds()...)
+	assertResizeFixture(t, output)
+}
+
+// writeResizeFixture writes a representative tree (file, dir, xattr, hardlink,
+// symlink) used by the resize end-to-end tests.
+func writeResizeFixture(t *testing.T, b *ext4fs.Image) {
+	t.Helper()
+
+	etc, err := b.CreateDirectory(ext4fs.RootInode, "etc", 0o755, 0, 0)
+	require.NoError(t, err)
+
+	_, err = b.CreateFile(etc, "hostname", []byte("resized-host\n"), 0o644, 0, 0)
+	require.NoError(t, err)
+
+	fileInode, err := b.CreateFile(ext4fs.RootInode, "data.txt", []byte("payload-content\n"), 0o644, 0, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, b.SetXattr(fileInode, "user.kind", []byte("fixture")))
+	require.NoError(t, b.Link(ext4fs.RootInode, "data.hardlink", fileInode))
+
+	_, err = b.CreateSymlink(ext4fs.RootInode, "data.symlink", "data.txt", 0, 0)
+	require.NoError(t, err)
+}
+
+// verifyResizeFixtureCmds returns the in-container commands that read back the
+// fixture written by writeResizeFixture.
+func verifyResizeFixtureCmds() []string {
+	return []string{
+		`cat etc/hostname`,
+		`cat data.txt`,
+		`cat data.hardlink`,
+		`A=$(stat -c "%i:%h" data.txt) && B=$(stat -c "%i:%h" data.hardlink) && test "$A" = "$B" && echo "HARDLINK-OK:$A"`,
+		`readlink data.symlink`,
+		`getfattr -n user.kind --only-values data.txt 2>/dev/null && echo`,
+		`echo RESIZE-VERIFY-DONE`,
+	}
+}
+
+// parseLabeledInt extracts the integer from the first "label=N" line in output.
+func parseLabeledInt(t *testing.T, output, label string) int {
+	t.Helper()
+
+	for _, line := range strings.Split(output, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), label)
+		if !ok {
+			continue
+		}
+
+		n, err := strconv.Atoi(strings.TrimSpace(rest))
+		require.NoError(t, err, "parse %q", line)
+
+		return n
+	}
+
+	t.Fatalf("label %q not found in output:\n%s", label, output)
+
+	return 0
+}
+
+// assertResizeFixture checks the output of verifyResizeFixtureCmds.
+func assertResizeFixture(t *testing.T, output string) {
+	t.Helper()
+
+	assert.Contains(t, output, "resized-host")
+	assert.Contains(t, output, "payload-content") // data.txt and its hardlink
+	assert.Contains(t, output, "HARDLINK-OK:")    // shared inode + link count 2
+	assert.Contains(t, output, "data.txt")        // symlink target
+	assert.Contains(t, output, "fixture")         // xattr value
+	assert.Contains(t, output, "RESIZE-VERIFY-DONE")
+}
+
+// =============================================================================
 // Fingerprint Test
 // =============================================================================
 
@@ -2865,6 +3160,69 @@ func newTestEnv(t *testing.T, sizeMB int) *testEnv {
 		imagePath: imagePath,
 		builder:   builder,
 	}
+}
+
+// newTestEnvOpts creates a test environment with arbitrary image options. The
+// image path (bind-mounted into Docker) is supplied automatically; callers add
+// size, label, etc. Useful for resize and label tests that need WithLabel or an
+// over-allocated canvas size.
+func newTestEnvOpts(t *testing.T, opts ...ext4fs.ImageOption) *testEnv {
+	t.Helper()
+
+	require.NotEmpty(t, sharedHostDir, "sharedHostDir must be initialized in TestMain")
+
+	imagePath := filepath.Join(sharedHostDir, fmt.Sprintf("test-%d.img", time.Now().UnixNano()))
+
+	allOpts := append([]ext4fs.ImageOption{ext4fs.WithImagePath(imagePath)}, opts...)
+
+	builder, err := ext4fs.New(allOpts...)
+	require.NoError(t, err, "failed to create ext4 image builder")
+
+	return &testEnv{
+		t:         t,
+		imagePath: imagePath,
+		builder:   builder,
+	}
+}
+
+// runInContainer runs a shell command inside the long-lived container WITHOUT
+// mounting the image. Use it for read-only inspection (e.g. dumpe2fs) that must
+// not mutate the artifact under test.
+func (e *testEnv) runInContainer(script string) (stdout, stderr string, err error) {
+	e.t.Helper()
+
+	if !dockerAvailable || dockerContainerID == "" {
+		return "", "", fmt.Errorf("docker test container not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "exec", dockerContainerID, "sh", "-c", script)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err = cmd.Run()
+
+	return stdoutBuf.String(), stderrBuf.String(), err
+}
+
+// dumpe2fsHeader returns the dumpe2fs superblock header for the image, used to
+// assert on-disk properties such as the volume label. It reads the image file
+// directly, without mounting, so it cannot mutate the artifact under test.
+func (e *testEnv) dumpe2fsHeader() string {
+	e.t.Helper()
+
+	remoteImage := filepath.Join(sharedContainerDir, filepath.Base(e.imagePath))
+
+	stdout, stderr, err := e.runInContainer(fmt.Sprintf("dumpe2fs -h %s 2>/dev/null", remoteImage))
+	if err != nil {
+		e.t.Fatalf("dumpe2fs failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+
+	return stdout
 }
 
 // finalize saves the image and closes the builder, making it ready for mounting.
@@ -2950,7 +3308,7 @@ func startDockerContainer() (string, error) {
 
 	installCmd := exec.Command(
 		"docker", "exec", containerID,
-		"apk", "add", "--no-cache", "e2fsprogs", "attr", "acl", "libcap",
+		"apk", "add", "--no-cache", "e2fsprogs", "e2fsprogs-extra", "attr", "acl", "libcap",
 	)
 
 	if err := installCmd.Run(); err != nil {

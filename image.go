@@ -16,6 +16,7 @@ type Image struct {
 	imagePath string // Path to the output image file
 	sizeBytes uint64 // Image size in Bytes
 	createdAt uint32 // Creation timestamp
+	label     string // Volume label written to the superblock
 }
 
 // New creates a new ext4 filesystem image with the provided options.
@@ -25,6 +26,7 @@ type Image struct {
 func New(opts ...ImageOption) (*Image, error) {
 	img := &Image{
 		createdAt: uint32(time.Now().Unix()),
+		label:     "ext4-go",
 	}
 	for _, opt := range opts {
 		if err := opt(img); err != nil {
@@ -46,6 +48,8 @@ func New(opts ...ImageOption) (*Image, error) {
 	}
 
 	img.builder = newBuilder(img.backend, layout)
+	img.builder.label = img.label
+	img.builder.skipZeroInit = true // freshly truncated image reads back as zero
 
 	if err := img.backend.truncate(int64(img.sizeBytes)); err != nil {
 		return nil, fmt.Errorf("failed to truncate image file: %w", err)
@@ -169,6 +173,39 @@ func (e *Image) Delete(parent uint32, name string) error {
 // Returns an error if the entry is not a directory.
 func (e *Image) DeleteDirectory(parent uint32, name string) error {
 	return e.builder.deleteDirectory(parent, name)
+}
+
+// Size returns the current logical volume size in bytes. It is useful for
+// computing grow targets, e.g. Resize(Size() + extraBytes).
+func (e *Image) Size() uint64 {
+	return e.builder.size()
+}
+
+// MinSize returns the smallest volume size, in bytes and block-aligned, that
+// still holds the current content. Resize(MinSize()) produces a volume of
+// exactly that size.
+//
+// It is a high-water mark, not a compaction: blocks freed by Delete below the
+// highest allocated block are not reclaimed (the library never relocates data).
+// MinSize respects both the highest allocated data block and the highest
+// allocated inode.
+func (e *Image) MinSize() uint64 {
+	return e.builder.minSize()
+}
+
+// Resize changes the volume to targetBytes, growing or shrinking as needed.
+// targetBytes is rounded up to the next whole block, so Resize(MinSize()) and
+// Resize(MinSize()+k*blockSize) are exact.
+//
+// Resize works both during a build session (New().Resize().Save()) and after
+// reopening (Open().Resize().Save()), in both directions. It refuses to operate
+// on volumes larger than 16 GiB / 128 groups, to grow past 16 GiB, or to shrink
+// below MinSize; such requests return an error and leave the image unchanged.
+//
+// Resize writes structural metadata but leaves free-count finalization to Save,
+// so it must be followed by Save.
+func (e *Image) Resize(targetBytes uint64) error {
+	return e.builder.resize(targetBytes)
 }
 
 // Save finalizes the filesystem and saves the image to disk.
