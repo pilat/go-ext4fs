@@ -275,6 +275,26 @@ func (b *builder) setInodeBit(inodeNum uint32) error {
 	return nil
 }
 
+// isInodeAllocated reports whether the inode is marked used in the inode bitmap.
+func (b *builder) isInodeAllocated(inodeNum uint32) (bool, error) {
+	if inodeNum < 1 || inodeNum > b.layout.TotalInodes() {
+		return false, nil
+	}
+
+	group := (inodeNum - 1) / inodesPerGroup
+	indexInGroup := (inodeNum - 1) % inodesPerGroup
+
+	gl := b.layout.GetGroupLayout(group)
+	offset := b.layout.BlockOffset(gl.InodeBitmapBlock) + uint64(indexInGroup/8)
+
+	var buf [1]byte
+	if err := b.disk.readAt(buf[:], int64(offset)); err != nil {
+		return false, fmt.Errorf("read inode bitmap for inode %d: %w", inodeNum, err)
+	}
+
+	return buf[0]&(1<<(indexInGroup%8)) != 0, nil
+}
+
 // clearInodeBit marks the specified inode as free in the bitmap.
 func (b *builder) clearInodeBit(inodeNum uint32) error {
 	if inodeNum < 1 {

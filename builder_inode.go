@@ -258,6 +258,37 @@ func (b *builder) readInode(inodeNum uint32) (*inode, error) {
 	return inode, nil
 }
 
+// readLiveInode reads an inode, rejecting numbers that are out of range or
+// not allocated in the inode bitmap. Without this check, operations against
+// freed or stale inode numbers would write into unrelated blocks once the
+// number is reused — including directory cycles when an inode is reallocated
+// inside its own former subtree (found by FuzzOps: stack overflow in
+// deleteDirectory).
+func (b *builder) readLiveInode(inodeNum uint32) (*inode, error) {
+	allocated, err := b.isInodeAllocated(inodeNum)
+	if err != nil {
+		return nil, err
+	}
+	if !allocated {
+		return nil, fmt.Errorf("inode %d is not allocated", inodeNum)
+	}
+
+	return b.readInode(inodeNum)
+}
+
+// readLiveDirInode reads an allocated inode and verifies it is a directory.
+func (b *builder) readLiveDirInode(inodeNum uint32) (*inode, error) {
+	ino, err := b.readLiveInode(inodeNum)
+	if err != nil {
+		return nil, err
+	}
+	if ino.Mode&0xF000 != s_IFDIR {
+		return nil, fmt.Errorf("inode %d is not a directory", inodeNum)
+	}
+
+	return ino, nil
+}
+
 // incrementLinkCount increases the hard link count for the specified inode.
 // This is called when a directory entry is added that references the inode,
 // ensuring the link count accurately reflects the number of directory references.

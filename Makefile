@@ -8,7 +8,7 @@ ifeq ($(UNAME_S),Darwin)
     LDFLAGS := -ldflags="-linkmode=external"
 endif
 
-.PHONY: lint tests coverage bench all
+.PHONY: lint tests coverage bench fuzz all
 
 all: fmt lint tests
 
@@ -40,3 +40,7 @@ fmt: $(GOLANGCI_LINT_PATH)
 bench:
 	@echo "===> Running benchmarks"
 	go test -bench=. -benchmem -run=^$ ./...
+
+fuzz:
+	@echo "===> Fuzzing (60s)"
+	go test $(LDFLAGS) -run=^$$ -fuzz=FuzzOps -fuzztime=60s .

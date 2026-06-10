@@ -251,6 +251,15 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		return nil, fmt.Errorf("unsupported inode size: %d (expected %d)", inodeSizeSB, inodeSize)
 	}
 
+	// Validate group geometry: all per-group offset math (bitmaps, inode
+	// tables) uses the package constants, not these superblock fields.
+	if blocksPerGroupSB != blocksPerGroup {
+		return nil, fmt.Errorf("unsupported blocks per group: %d (expected %d)", blocksPerGroupSB, blocksPerGroup)
+	}
+	if inodesPerGroupSB != inodesPerGroup {
+		return nil, fmt.Errorf("unsupported inodes per group: %d (expected %d)", inodesPerGroupSB, inodesPerGroup)
+	}
+
 	// Calculate partition size from block count
 	partitionSize := uint64(blocksCountLo) * blockSize
 
