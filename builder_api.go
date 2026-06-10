@@ -24,6 +24,14 @@ func (b *builder) createDirectory(parentInode uint32, name string, mode, uid, gi
 		return 0, fmt.Errorf("invalid directory name: %w", err)
 	}
 
+	existingInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check for existing entry: %w", err)
+	}
+	if existingInode != 0 {
+		return 0, fmt.Errorf("entry %q already exists", name)
+	}
+
 	inodeNum, err := b.allocateInode()
 	if err != nil {
 		return 0, err
@@ -90,6 +98,16 @@ func (b *builder) createFile(parentInode uint32, name string, content []byte, mo
 	}
 
 	if existingInode != 0 {
+		existing, err := b.readInode(existingInode)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read existing inode: %w", err)
+		}
+		// Overwrite is defined for regular files only; silently turning a
+		// directory or symlink into a file would orphan its subtree and
+		// leave the parent dirent with a stale file type.
+		if existing.Mode&0xF000 != s_IFREG {
+			return 0, fmt.Errorf("entry %q exists and is not a regular file", name)
+		}
 		return b.overwriteFile(existingInode, content, mode, uid, gid)
 	}
 
@@ -309,6 +327,14 @@ func (b *builder) createSymlink(parentInode uint32, name, target string, uid, gi
 		return 0, fmt.Errorf("symlink target too long: %d > 4096", len(target))
 	}
 
+	existingInode, err := b.findEntry(parentInode, name)
+	if err != nil {
+		return 0, fmt.Errorf("failed to check for existing entry: %w", err)
+	}
+	if existingInode != 0 {
+		return 0, fmt.Errorf("entry %q already exists", name)
+	}
+
 	inodeNum, err := b.allocateInode()
 	if err != nil {
 		return 0, err
@@ -387,10 +413,12 @@ func (b *builder) link(parentInode uint32, name string, targetInode uint32) erro
 		return fmt.Errorf("entry %q already exists", name)
 	}
 
-	inode, err := b.readInode(targetInode)
+	inode, err := b.readLiveInode(targetInode)
 	if err != nil {
 		return fmt.Errorf("failed to read target inode: %w", err)
 	}
+	// The bitmap bit can be set for a half-created inode whose table entry
+	// was never written (failed create); a zero LinksCount exposes it.
 	if inode.LinksCount == 0 {
 		return fmt.Errorf("target inode %d has link count 0 (freed or never allocated)", targetInode)
 	}
@@ -602,7 +630,7 @@ func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
 		return fmt.Errorf("xattr name too long: %d > 255", len(shortName))
 	}
 
-	inode, err := b.readInode(inodeNum)
+	inode, err := b.readLiveInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for xattr: %w", err)
 	}
@@ -672,7 +700,7 @@ func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
 // The returned names include their namespace prefixes (e.g., "user.attr", "trusted.security").
 // Returns an empty slice if the inode has no extended attributes.
 func (b *builder) listXattrs(inodeNum uint32) ([]string, error) {
-	inode, err := b.readInode(inodeNum)
+	inode, err := b.readLiveInode(inodeNum)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read inode for xattr listing: %w", err)
 	}
@@ -705,7 +733,7 @@ func (b *builder) removeXattr(inodeNum uint32, name string) error {
 		return err
 	}
 
-	inode, err := b.readInode(inodeNum)
+	inode, err := b.readLiveInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for xattr removal: %w", err)
 	}

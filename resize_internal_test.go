@@ -178,6 +178,32 @@ func TestSize(t *testing.T) {
 	assert.Equal(t, uint64(8*1024*1024), img.Size())
 }
 
+func TestMemoryImageLifecycle(t *testing.T) {
+	img, err := New(WithMemoryBackend(), WithSizeInMB(8))
+	require.NoError(t, err)
+
+	_, err = img.CreateFile(RootInode, "hello", []byte("world"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	require.NoError(t, img.Save())
+	require.NoError(t, img.Close())
+}
+
+func TestWithSize(t *testing.T) {
+	img, err := New(WithMemoryBackend(), WithSize(8*1024*1024))
+	require.NoError(t, err)
+	assert.Equal(t, uint64(8*1024*1024), img.Size())
+}
+
+func TestLayoutString(t *testing.T) {
+	img, err := New(WithMemoryBackend(), WithSizeInMB(8))
+	require.NoError(t, err)
+
+	s := img.builder.layout.String()
+	assert.Contains(t, s, "Group count: 1")
+	assert.Contains(t, s, fmt.Sprintf("Total blocks: %d", img.builder.layout.TotalBlocks))
+}
+
 func TestMinBlocksAlgorithm(t *testing.T) {
 	t.Run("empty fs is bounded by group 0 metadata", func(t *testing.T) {
 		b := newSyntheticBuilder(t, 128)

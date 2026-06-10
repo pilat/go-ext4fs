@@ -44,7 +44,7 @@ func (b *builder) writeDirBlock(blockNum uint32, entries []dirEntry) error {
 // Searches existing directory blocks for space, or allocates new blocks if needed.
 // Updates the directory's size and block allocation as entries are added.
 func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
-	inode, err := b.readInode(dirInode)
+	inode, err := b.readLiveDirInode(dirInode)
 	if err != nil {
 		return fmt.Errorf("failed to read directory inode: %w", err)
 	}
@@ -221,7 +221,7 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 // Returns the inode number if found, or 0 if the entry doesn't exist.
 // Used to check for existing files before creation or overwriting.
 func (b *builder) findEntry(dirInode uint32, name string) (uint32, error) {
-	inode, err := b.readInode(dirInode)
+	inode, err := b.readLiveDirInode(dirInode)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read directory inode for entry search: %w", err)
 	}

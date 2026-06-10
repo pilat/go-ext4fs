@@ -78,8 +78,10 @@ func TestMain(m *testing.M) {
 	}
 
 	if err := exec.Command("docker", "info").Run(); err != nil {
+		// Unit tests, the fuzz target and its corpus still run; only the
+		// kernel-backed e2e tests skip (via skipIfNoDocker).
 		fmt.Fprintln(os.Stderr, "Docker not available, skipping e2e tests")
-		os.Exit(0)
+		os.Exit(m.Run())
 	}
 
 	dockerAvailable = true
@@ -138,10 +140,11 @@ func TestExt4FS(t *testing.T) {
 		{"MultiBlockDirectory", testMultiBlockDirectory},
 		{"MultiBlockDirectoryWithSymlinks", testMultiBlockDirectoryWithSymlinks},
 		{"MultiBlockDirectoryNested", testMultiBlockDirectoryNested},
-		{"ExtentTreeConversion", testExtentTreeConversion},
+		{"ManySmallFiles", testManySmallFiles},
 		{"DirectoryExtentTree", testDirectoryExtentTree},
-		{"ExtentTreeLeafAllocation", testExtentTreeLeafAllocation},
-		{"ExtentTreeManyExtents", testExtentTreeManyExtents},
+		{"FreedBlockRunReuse", testFreedBlockRunReuse},
+		{"LargeFileAfterFragmentation", testLargeFileAfterFragmentation},
+		{"ExtentTreeMultiGroup", testExtentTreeMultiGroup},
 		{"XattrBasic", testXattrBasic},
 		{"XattrSELinux", testXattrSELinux},
 		{"XattrMultiple", testXattrMultiple},
@@ -1060,7 +1063,12 @@ func testMultiBlockDirectoryNested(t *testing.T) {
 	assert.Contains(t, output, "level 2 content")
 }
 
-func testExtentTreeConversion(t *testing.T) {
+// testManySmallFiles creates 500 small files in one directory and verifies
+// they all survive a kernel mount. Despite its former name
+// (testExtentTreeConversion), this never reached the extent-tree code: each
+// file is a single contiguous extent. It guards directory growth and inode
+// allocation at volume.
+func testManySmallFiles(t *testing.T) {
 	env := newTestEnv(t, 128)
 
 	testDir, err := env.builder.CreateDirectory(ext4fs.RootInode, "extent_test", 0755, 0, 0)
@@ -1093,8 +1101,13 @@ func testExtentTreeConversion(t *testing.T) {
 	assert.Contains(t, output, "Content 499")
 }
 
-func testExtentTreeLeafAllocation(t *testing.T) {
-	env := newTestEnv(t, 128) // Larger image to have space
+// testFreedBlockRunReuse overwrites a multi-block file and creates an
+// equally-sized one, which must reuse the freed run as a single contiguous
+// extent (best-fit allocator, PR #4). Despite its former name
+// (testExtentTreeLeafAllocation), no extent tree is built here — that is
+// exactly the point of the #4 fix.
+func testFreedBlockRunReuse(t *testing.T) {
+	env := newTestEnv(t, 128)
 
 	// Create a large file to allocate many contiguous blocks
 	largeContent := make([]byte, 20*4096)
@@ -1109,7 +1122,7 @@ func testExtentTreeLeafAllocation(t *testing.T) {
 	_, err = env.builder.CreateFile(ext4fs.RootInode, "big1", smallContent, 0644, 0, 0)
 	require.NoError(t, err)
 
-	// Now create another large file, which should use the freed blocks (non-contiguous)
+	// The freed 20-block run must be reused for the next file of the same size
 	_, err = env.builder.CreateFile(ext4fs.RootInode, "big2", largeContent, 0644, 0, 0)
 	require.NoError(t, err)
 
@@ -1120,18 +1133,23 @@ func testExtentTreeLeafAllocation(t *testing.T) {
 		`test -f "big2" && echo "big2 exists"`,
 		`cat "big1"`,
 		`stat -c "%s" "big2"`,
+		`filefrag big2`,
 	)
 
 	assert.Contains(t, output, "big1 exists")
 	assert.Contains(t, output, "big2 exists")
 	assert.Contains(t, output, "small")
 	assert.Contains(t, output, fmt.Sprintf("%d", 20*4096))
+	assert.Equal(t, 1, filefragExtentCount(t, output), "big2 must reuse the freed run as one contiguous extent")
 }
 
-// testExtentTreeManyExtents tests file creation with more than 340 extents.
-// This exercises the multi-leaf extent tree code path where extents must be
-// split across multiple leaf blocks (max 340 extents per leaf).
-func testExtentTreeManyExtents(t *testing.T) {
+// testLargeFileAfterFragmentation heavily fragments the free space and then
+// creates a large file. The allocator must NOT stitch the file together from
+// the single-block holes (that was the bug fixed in PR #4 — thousands of
+// extents); it must fall back to fresh contiguous blocks from the group tail.
+// Despite its former name (testExtentTreeManyExtents), this never builds an
+// extent tree — the allocator sidesteps fragmentation by design.
+func testLargeFileAfterFragmentation(t *testing.T) {
 	env := newTestEnv(t, 256) // Larger image to have enough space
 
 	// Create 700 single-block files to allocate blocks
@@ -1141,16 +1159,14 @@ func testExtentTreeManyExtents(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Delete every other file to create fragmentation
-	// This leaves gaps in the block allocation that will be reused
+	// Delete every other file, leaving 350 single-block holes
 	for i := 0; i < 700; i += 2 {
 		err := env.builder.Delete(ext4fs.RootInode, fmt.Sprintf("frag_%04d.txt", i))
 		require.NoError(t, err)
 	}
 
-	// Create a large file that requires 350+ blocks
-	// With fragmentation, each freed block becomes a separate extent
-	// 350 extents > 340 max per leaf, triggering multi-leaf extent tree
+	// No freed run fits 350 blocks, so the allocator must take fresh
+	// contiguous blocks past the high-water mark instead of the holes
 	largeContent := make([]byte, 350*4096)
 	for i := range largeContent {
 		largeContent[i] = byte(i % 256)
@@ -1164,12 +1180,71 @@ func testExtentTreeManyExtents(t *testing.T) {
 		`test -f "fragmented_large.bin" && echo "file exists"`,
 		`stat -c "%s" "fragmented_large.bin"`,
 		`md5sum "fragmented_large.bin" | cut -d' ' -f1`,
+		`filefrag fragmented_large.bin`,
 	)
 
 	assert.Contains(t, output, "file exists")
 	assert.Contains(t, output, fmt.Sprintf("%d", 350*4096))
 	// Verify data integrity - content is deterministic: byte(i % 256)
 	assert.Contains(t, output, "927be24bf1e37fc370e57d3d25ee929b")
+	assert.Equal(t, 1, filefragExtentCount(t, output), "allocator must take fresh contiguous tail blocks, not stitch the holes")
+}
+
+// testExtentTreeMultiGroup creates a file spanning five block groups. Fresh
+// allocation is contiguous within a group but breaks at every group's
+// metadata blocks, so the file collects >4 extents and the inode must be
+// converted to a depth-1 extent tree (the inline inode area fits only 4).
+// filefrag pins the actual extent count so this test cannot silently degrade
+// into a single-extent file — the fate of the original "extent tree" e2e
+// tests after the PR #4 allocator rework.
+func testExtentTreeMultiGroup(t *testing.T) {
+	env := newTestEnv(t, 640) // five 128 MiB block groups
+
+	const fileSize = 520 << 20 // more than 4 groups of data, so >= 5 extents
+	content := make([]byte, fileSize)
+	for i := range content {
+		content[i] = byte(i % 256)
+	}
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "spanning.bin", content, 0644, 0, 0)
+	require.NoError(t, err)
+
+	sum := sha256.Sum256(content)
+
+	env.finalize()
+
+	output := env.dockerExecSimple(
+		`stat -c "%s" spanning.bin`,
+		`filefrag spanning.bin`,
+		`sha256sum spanning.bin | cut -d' ' -f1`,
+	)
+
+	assert.Contains(t, output, fmt.Sprintf("%d", fileSize))
+	assert.Contains(t, output, hex.EncodeToString(sum[:]))
+
+	extents := filefragExtentCount(t, output)
+	assert.GreaterOrEqual(t, extents, 5,
+		"file must have >4 extents, otherwise the depth-1 extent tree path was not exercised")
+}
+
+// filefragExtentCount extracts N from filefrag's "N extents found" line.
+func filefragExtentCount(t *testing.T, output string) int {
+	t.Helper()
+
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "extent") || !strings.Contains(line, "found") {
+			continue
+		}
+		fields := strings.Fields(line) // e.g. "spanning.bin: 5 extents found"
+		for i, f := range fields {
+			if strings.HasPrefix(f, "extent") && i > 0 {
+				n, err := strconv.Atoi(fields[i-1])
+				require.NoError(t, err, "unparseable filefrag line: %q", line)
+				return n
+			}
+		}
+	}
+	t.Fatalf("no 'extents found' line in filefrag output: %q", output)
+	return 0
 }
 
 func testDirectoryExtentTree(t *testing.T) {
