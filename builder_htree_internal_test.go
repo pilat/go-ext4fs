@@ -607,7 +607,7 @@ func writeOversizedLinearDir(t *testing.T, b *builder, dInode, parent uint32, n 
 	}
 	ino.SizeLo = total * blockSize
 	for i, be := range blocksEntries {
-		if err := b.writeDirBlock(blocks[i], be); err != nil {
+		if err := b.writeDirBlock(blocks[i], dInode, 0, be); err != nil {
 			t.Fatalf("writeDirBlock %d: %v", i, err)
 		}
 	}

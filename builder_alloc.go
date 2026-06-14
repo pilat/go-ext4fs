@@ -21,6 +21,19 @@ func (b *builder) freeBlockRun(start, count uint32) error {
 	return nil
 }
 
+// freeBlocks releases a list of (possibly non-contiguous) blocks. It is used to
+// roll back an allocation whose operation was rejected before the blocks were
+// linked into an inode, so a failed write leaves no orphaned allocation behind.
+func (b *builder) freeBlocks(blocks []uint32) error {
+	for _, blk := range blocks {
+		if err := b.freeBlockRun(blk, 1); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // addFreeRun adds a free run to freeRuns, maintaining sorted order by count (ascending).
 // This is used during Open() when scanning existing bitmaps for holes.
 func (b *builder) addFreeRun(run freeRun) {

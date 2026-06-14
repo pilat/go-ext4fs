@@ -140,6 +140,10 @@ func (b *builder) setExtentMultiple(inode *inode, blocks []uint32) error {
 
 // writeExtentTree creates an indexed extent tree for files with many extents.
 func (b *builder) writeExtentTree(inode *inode, extents []extent) error {
+	if b.csumEnabled {
+		return csumUnsupported("external extent trees")
+	}
+
 	const maxIndexEntries = 4
 	const maxTotalExtents = maxExtentsPerLeaf * maxIndexEntries // 1360
 
@@ -234,7 +238,18 @@ func (b *builder) writeInode(inodeNum uint32, inode *inode) error {
 		return fmt.Errorf("failed to encode inode %d: %w", inodeNum, err)
 	}
 
-	if err := b.disk.writeAt(buf.Bytes(), int64(b.layout.InodeOffset(inodeNum))); err != nil {
+	data := buf.Bytes()
+
+	// metadata_csum: checksum the final 256-byte image (both checksum fields
+	// zeroed during compute) and patch the two halves. This is the sole inode
+	// write path, so every persisted version is self-correctingly valid.
+	if b.csumEnabled {
+		lo, hi := inodeCsum(b.csumSeed, inodeNum, data)
+		binary.LittleEndian.PutUint16(data[0x7C:], lo)
+		binary.LittleEndian.PutUint16(data[0x82:], hi)
+	}
+
+	if err := b.disk.writeAt(data, int64(b.layout.InodeOffset(inodeNum))); err != nil {
 		return fmt.Errorf("failed to write inode %d: %w", inodeNum, err)
 	}
 
@@ -400,6 +415,10 @@ func (b *builder) addBlockToInode(inodeNum, newBlock uint32) error {
 // Creates an extent index block to manage multiple extents efficiently.
 // Required when a file or directory exceeds the capacity of inline extent storage.
 func (b *builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
+	if b.csumEnabled {
+		return csumUnsupported("external extent trees")
+	}
+
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read inode for extent conversion: %w", err)
@@ -461,6 +480,10 @@ func (b *builder) convertToIndexedExtents(inodeNum, newBlock uint32) error {
 // Updates the extent index structure to include the new extent mapping.
 // Handles the complexity of maintaining sorted extent indices.
 func (b *builder) addBlockToIndexedInode(inodeNum, newBlock uint32) error {
+	if b.csumEnabled {
+		return csumUnsupported("external extent trees")
+	}
+
 	inode, err := b.readInode(inodeNum)
 	if err != nil {
 		return fmt.Errorf("failed to read indexed inode: %w", err)

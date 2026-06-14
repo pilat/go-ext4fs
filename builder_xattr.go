@@ -162,6 +162,23 @@ func (b *builder) overwriteFile(inodeNum uint32, content []byte, mode, uid, gid 
 	return inodeNum, nil
 }
 
+// upsertXattr replaces the value of the entry matching (nameIndex, shortName),
+// or appends a new entry when none matches, returning the updated slice.
+func upsertXattr(entries []xAttrEntry, nameIndex uint8, shortName string, value []byte) []xAttrEntry {
+	for i, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			entries[i].Value = value
+			return entries
+		}
+	}
+
+	return append(entries, xAttrEntry{
+		NameIndex: nameIndex,
+		Name:      shortName,
+		Value:     value,
+	})
+}
+
 // writeXattrBlock writes extended attribute entries to a dedicated block.
 // Extended attributes are stored in a special format with hash-based ordering
 // for efficient lookup. The block is referenced from the inode's FileACLLo field.

@@ -31,6 +31,14 @@ type Layout struct {
 	HashSeed       [4]uint32
 	DefHashVersion uint8
 	UnsignedHash   bool
+
+	// metadata_csum, populated by loadLayoutFromDisk when reopening an image.
+	// CsumEnabled means the on-disk image carries metadata_csum, so writes must keep
+	// maintaining checksums; CsumSeed is the FS-wide seed (read from s_checksum_seed
+	// when metadata_csum_seed is set, else derived from the UUID). Left zero/false on
+	// the New path, where the builder takes these from the WithChecksum option.
+	CsumEnabled bool
+	CsumSeed    uint32
 }
 
 // GroupLayout holds the block positions and metadata layout for a specific block group.
@@ -246,9 +254,6 @@ func checkROCompatFeatures(featureROCompat uint32) error {
 	if unsupported&roCompatBigalloc != 0 {
 		features = append(features, "bigalloc")
 	}
-	if unsupported&roCompatMetadataCsum != 0 {
-		features = append(features, "metadata_csum")
-	}
 	if len(features) == 0 {
 		features = append(features, fmt.Sprintf("0x%x", unsupported))
 	}
@@ -342,6 +347,24 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 	// htree rebuild and the index no longer resolves by name.
 	unsignedHash := sbFlags&flagsUnsignedHash != 0 || defHashVersion == hashVersionHalfMD4Unsigned
 
+	// metadata_csum is in roCompatSupported, so a checksummed image opened. When
+	// present, capture the FS-wide seed — read from s_checksum_seed (0x270) when
+	// metadata_csum_seed is set (the seed is then decoupled from the UUID, e.g. after
+	// a tune2fs -U), otherwise derived from the on-disk UUID — so post-reopen writes
+	// keep the checksums valid.
+	var (
+		csumEnabled bool
+		csumSeed    uint32
+	)
+	if featureROCompat&roCompatMetadataCsum != 0 {
+		csumEnabled = true
+		if featureIncompat&incompatCsumSeed != 0 {
+			csumSeed = binary.LittleEndian.Uint32(sbData[0x270:0x274])
+		} else {
+			csumSeed = deriveCsumSeed(sbData[0x68 : 0x68+16])
+		}
+	}
+
 	// Calculate partition size from block count
 	partitionSize := uint64(blocksCountLo) * blockSize
 
@@ -360,6 +383,8 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		HashSeed:         hashSeed,
 		DefHashVersion:   defHashVersion,
 		UnsignedHash:     unsignedHash,
+		CsumEnabled:      csumEnabled,
+		CsumSeed:         csumSeed,
 	}
 
 	return layout, nil

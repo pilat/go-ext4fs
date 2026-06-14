@@ -70,6 +70,11 @@ go get github.com/pilat/go-ext4fs
 - **Two-way resize** — build on a roomy canvas, then shrink to fit (or grow later)
 - **Reproducible images** — fixed timestamp in, identical bytes out
 - **Custom volume label** — mount by `LABEL=` from the guest
+- **HTree directories** — large directories are emitted as depth-1 hash-tree
+  (`dir_index`) indexes with a byte-exact half_md4 hash, so they open by name
+- **Optional checksums** — `WithChecksum()` writes a `metadata_csum` filesystem,
+  with a CRC32C on every superblock, group descriptor, bitmap, inode and directory
+  block; `e2fsck` and a real kernel accept the feature (off by default)
 - **Modify your own images** — reopen, replace files, save again
 - **Defensive API** — stale inode handles, duplicate names, and type-confused
   overwrites are rejected instead of corrupting the image
@@ -148,8 +153,11 @@ img.Save()
 img.Close()
 ```
 
-Filesystems produced by `mke2fs` cannot be opened: they carry features this library
-deliberately does not implement (journaling, 64-bit, flex_bg).
+A stock `mke2fs` image is still rejected when it carries features this library
+cannot rewrite (journaling, 64-bit, flex_bg, reserved GDT blocks, …). A foreign
+image of this library's geometry now opens, though: its htree directories are
+maintained on edit, and a `metadata_csum` image (even one whose UUID was changed
+with `tune2fs`) keeps its checksums valid across the edit.
 
 ## Limitations
 
@@ -164,7 +172,8 @@ Optimized for boot disks, rootfs images and fixtures — not a general-purpose m
 | Inline data | Small files occupy one full block |
 | Encryption, quotas | Not implemented |
 | Resize beyond 16 GiB | Larger images can be created, not resized |
-| Opening foreign images | `Open` only accepts images created by this library; `mke2fs` output is rejected |
+| Opening foreign images | `Open` accepts images of this library's geometry and rejects features it cannot rewrite (64-bit, flex_bg, journal, bigalloc, quota, gdt_csum, reserved GDT) |
+| Checksums with htree, xattrs, external extent trees or resize | `WithChecksum` keeps directories linear and refuses these combinations rather than emit an image `e2fsck` would fault |
 
 If you need to *read* arbitrary ext4 filesystems instead of writing them, look at
 dsoprea/go-ext4 or masahiro331/go-ext4-filesystem — that's the half of the problem
