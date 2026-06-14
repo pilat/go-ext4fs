@@ -76,6 +76,9 @@ func (b *builder) createDirectory(parentInode uint32, name string, mode, uid, gi
 	group := (inodeNum - 1) / inodesPerGroup
 	b.usedDirsPerGroup[group]++
 
+	// Register for possible htree indexing at finalize (own params).
+	b.reindexDirs[inodeNum] = reindexInfo{}
+
 	if b.debug {
 		fmt.Printf("✓ Created directory: %s (inode %d)\n", name, inodeNum)
 	}
@@ -271,6 +274,30 @@ func (b *builder) updateGroupDescriptor(g uint32, freeBlocks, freeInodes, usedDi
 	return nil
 }
 
+// applyDirIndexFlags records the dir_index feature and the directory-hash
+// signedness in a superblock buffer when an own-origin directory was htree
+// indexed (decision 8). It ORs compatDirIndex into s_feature_compat (0x5C) and
+// sets the signedness bit in s_flags (0x160). It is a no-op otherwise, so the
+// default (no indexed directory) path leaves the superblock byte-for-byte
+// unchanged. Applied to the primary AND every backup so e2fsck sees no mismatch;
+// never invoked for foreign images (their s_flags is preserved verbatim).
+func (b *builder) applyDirIndexFlags(sbBuf []byte) {
+	if !b.dirIndexUsed {
+		return
+	}
+
+	feat := binary.LittleEndian.Uint32(sbBuf[0x5C:0x60]) | compatDirIndex
+	binary.LittleEndian.PutUint32(sbBuf[0x5C:0x60], feat)
+
+	flags := binary.LittleEndian.Uint32(sbBuf[0x160:0x164])
+	if b.signedHash {
+		flags |= flagsSignedHash
+	} else {
+		flags |= flagsUnsignedHash
+	}
+	binary.LittleEndian.PutUint32(sbBuf[0x160:0x164], flags)
+}
+
 // updateSuperblocks updates the primary and backup superblocks with total free blocks and inodes.
 func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) error {
 	// Update primary superblock
@@ -283,6 +310,7 @@ func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) err
 
 	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
 	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
+	b.applyDirIndexFlags(sbBuf)
 
 	if err := b.disk.writeAt(sbBuf, int64(sbOffset)); err != nil {
 		return fmt.Errorf("failed to write primary superblock: %w", err)
@@ -300,6 +328,7 @@ func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) err
 
 			binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
 			binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
+			b.applyDirIndexFlags(sbBuf)
 
 			if err := b.disk.writeAt(sbBuf, int64(backupSbOffset)); err != nil {
 				return fmt.Errorf("failed to write backup superblock for group %d: %w", g, err)

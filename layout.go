@@ -24,6 +24,13 @@ type Layout struct {
 
 	// Timestamps
 	CreatedAt uint32
+
+	// Directory hash parameters, populated by loadLayoutFromDisk on Open so the
+	// htree maintenance path hashes names with the image's own seed, version and
+	// signedness (never our own — see decision 4/7). Unused on the New path.
+	HashSeed       [4]uint32
+	DefHashVersion uint8
+	UnsignedHash   bool
 }
 
 // GroupLayout holds the block positions and metadata layout for a specific block group.
@@ -188,6 +195,36 @@ func (l *Layout) String() string {
 		l.TotalFreeBlocks())
 }
 
+// checkIncompatFeatures returns an error naming any required (incompat) features
+// the image carries that this library does not support.
+func checkIncompatFeatures(featureIncompat uint32) error {
+	unsupported := featureIncompat &^ incompatSupported
+	if unsupported == 0 {
+		return nil
+	}
+
+	var features []string
+	if unsupported&incompatJournal != 0 {
+		features = append(features, "has_journal")
+	}
+	if unsupported&incompatMetaBG != 0 {
+		features = append(features, "meta_bg")
+	}
+	if unsupported&incompat64bit != 0 {
+		features = append(features, "64bit")
+	}
+	if unsupported&incompatFlexBG != 0 {
+		features = append(features, "flex_bg")
+	}
+	if unsupported&incompatEncrypt != 0 {
+		features = append(features, "encrypt")
+	}
+	if len(features) == 0 {
+		features = append(features, fmt.Sprintf("0x%x", unsupported))
+	}
+	return fmt.Errorf("unsupported filesystem features: %v (only images created by this library are supported)", features)
+}
+
 // loadLayoutFromDisk reads the superblock from an existing ext4 filesystem
 // and reconstructs the Layout struct from the on-disk metadata.
 // It validates the ext4 magic number, block size (4096), inode size (256),
@@ -213,31 +250,13 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 	inodesPerGroupSB := binary.LittleEndian.Uint32(sbData[0x28:0x2C])
 	inodeSizeSB := binary.LittleEndian.Uint16(sbData[0x58:0x5A])
 	featureIncompat := binary.LittleEndian.Uint32(sbData[0x60:0x64])
+	featureROCompat := binary.LittleEndian.Uint32(sbData[0x64:0x68])
+	reservedGDTBlocks := binary.LittleEndian.Uint16(sbData[0xCE:0xD0])
 	mkfsTime := binary.LittleEndian.Uint32(sbData[0x108:0x10C])
 
 	// Check for unsupported incompatible features
-	unsupported := featureIncompat &^ incompatSupported
-	if unsupported != 0 {
-		var features []string
-		if unsupported&incompatJournal != 0 {
-			features = append(features, "has_journal")
-		}
-		if unsupported&incompatMetaBG != 0 {
-			features = append(features, "meta_bg")
-		}
-		if unsupported&incompat64bit != 0 {
-			features = append(features, "64bit")
-		}
-		if unsupported&incompatFlexBG != 0 {
-			features = append(features, "flex_bg")
-		}
-		if unsupported&incompatEncrypt != 0 {
-			features = append(features, "encrypt")
-		}
-		if len(features) == 0 {
-			features = append(features, fmt.Sprintf("0x%x", unsupported))
-		}
-		return nil, fmt.Errorf("unsupported filesystem features: %v (only images created by this library are supported)", features)
+	if err := checkIncompatFeatures(featureIncompat); err != nil {
+		return nil, err
 	}
 
 	// Validate block size matches our expectation
@@ -260,6 +279,26 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		return nil, fmt.Errorf("unsupported inodes per group: %d (expected %d)", inodesPerGroupSB, inodesPerGroup)
 	}
 
+	// Refuse images we would silently corrupt by modifying. metadata_csum requires
+	// rewriting checksums on every metadata block we touch (not yet supported off
+	// this branch); a non-zero reserved-GDT count (resize_inode) shifts every
+	// per-group metadata offset, which our geometry model does not account for.
+	if featureROCompat&roCompatMetadataCsum != 0 {
+		return nil, fmt.Errorf("metadata_csum filesystems are not supported for modification")
+	}
+	if reservedGDTBlocks != 0 {
+		return nil, fmt.Errorf("filesystems with reserved GDT blocks (resize_inode) are not supported for modification")
+	}
+
+	// Capture the directory-hash parameters so htree maintenance hashes names with
+	// the image's own seed/version/signedness.
+	var hashSeed [4]uint32
+	for i := 0; i < 4; i++ {
+		hashSeed[i] = binary.LittleEndian.Uint32(sbData[0xEC+i*4 : 0xF0+i*4])
+	}
+	defHashVersion := sbData[0xFC]
+	sbFlags := binary.LittleEndian.Uint32(sbData[0x160:0x164])
+
 	// Calculate partition size from block count
 	partitionSize := uint64(blocksCountLo) * blockSize
 
@@ -275,6 +314,9 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		InodesPerGroup:   inodesPerGroupSB,
 		InodeTableBlocks: (inodesPerGroupSB * uint32(inodeSizeSB)) / blockSize,
 		CreatedAt:        mkfsTime,
+		HashSeed:         hashSeed,
+		DefHashVersion:   defHashVersion,
+		UnsignedHash:     sbFlags&flagsUnsignedHash != 0,
 	}
 
 	return layout, nil

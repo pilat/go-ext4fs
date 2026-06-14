@@ -15,10 +15,7 @@ func (b *builder) writeDirBlock(blockNum uint32, entries []dirEntry) error {
 	for i, entry := range entries {
 		nameLen := len(entry.Name)
 
-		recLen := 8 + nameLen
-		if recLen%4 != 0 {
-			recLen += 4 - (recLen % 4)
-		}
+		recLen := dirRecLen(nameLen)
 
 		if i == len(entries)-1 {
 			recLen = blockSize - offset
@@ -49,17 +46,26 @@ func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 		return fmt.Errorf("failed to read directory inode: %w", err)
 	}
 
+	// htree guard: a linear insert into a hash-indexed directory would overwrite
+	// its dx_root index (the corruption this whole feature fixes). On the first
+	// such insert, flatten the directory to linear and queue it for re-index at
+	// finalize; then fall through to the ordinary linear insert below.
+	if inode.Flags&inodeFlagIndex != 0 {
+		if err := b.prepareHtreeForMutation(dirInode); err != nil {
+			return err
+		}
+		inode, err = b.readLiveDirInode(dirInode)
+		if err != nil {
+			return fmt.Errorf("failed to re-read flattened directory inode: %w", err)
+		}
+	}
+
 	dataBlocks, err := b.getInodeBlocks(inode)
 	if err != nil {
 		return fmt.Errorf("failed to get directory blocks: %w", err)
 	}
 
-	newNameLen := len(entry.Name)
-
-	newRecLen := 8 + newNameLen
-	if newRecLen%4 != 0 {
-		newRecLen += 4 - (newRecLen % 4)
-	}
+	newRecLen := dirRecLen(len(entry.Name))
 
 	for _, blockNum := range dataBlocks {
 		if success, err := b.tryAddEntryToBlock(blockNum, entry, newRecLen); err != nil {
@@ -82,7 +88,7 @@ func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 	block := make([]byte, blockSize)
 	binary.LittleEndian.PutUint32(block[0:], entry.Inode)
 	binary.LittleEndian.PutUint16(block[4:], uint16(blockSize))
-	block[6] = uint8(newNameLen)
+	block[6] = uint8(len(entry.Name))
 	block[7] = entry.Type
 	copy(block[8:], entry.Name)
 
@@ -127,12 +133,7 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 		offset += int(recLen)
 	}
 
-	lastNameLen := int(block[lastOffset+6])
-
-	lastActualSize := 8 + lastNameLen
-	if lastActualSize%4 != 0 {
-		lastActualSize += 4 - (lastActualSize % 4)
-	}
+	lastActualSize := dirRecLen(int(block[lastOffset+6]))
 
 	lastRecLen := int(binary.LittleEndian.Uint16(block[lastOffset+4:]))
 
@@ -215,6 +216,78 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 	}
 
 	return fmt.Errorf("entry %q not found in directory", name)
+}
+
+// readAllEntries enumerates every real entry of a directory and recovers the
+// parent inode from its ".." record. It is the htree-aware counterpart to
+// listDirEntries used by the htree rebuild: the returned entries exclude "." and
+// ".." (emit re-synthesizes those into the dx_root, flatten into block 0), while
+// the parent inode — which listDirEntries discards — is returned separately
+// because a rebuild must preserve it verbatim.
+//
+// Like listDirEntries it brute-scans every mapped data block, which is correct at
+// any htree depth: in a dx_root the ".." record's rec_len runs to end-of-block, so
+// a linear walk never reaches the index; dx_node index blocks begin with an
+// inode=0 filler whose rec_len spans the block, so they contribute nothing; leaf
+// blocks are ordinary dirent blocks. Hardlinks and file types pass through
+// verbatim (each name is enumerated independently).
+func (b *builder) readAllEntries(dirInode uint32) ([]dirEntry, uint32, error) {
+	inode, err := b.readLiveDirInode(dirInode)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read directory inode: %w", err)
+	}
+
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get directory blocks: %w", err)
+	}
+
+	var (
+		entries     []dirEntry
+		parentInode uint32
+	)
+
+	for _, blockNum := range dataBlocks {
+		block := make([]byte, blockSize)
+		if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+			return nil, 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+		}
+
+		offset := 0
+		for offset < blockSize {
+			recLen := binary.LittleEndian.Uint16(block[offset+4:])
+			if recLen == 0 {
+				break
+			}
+
+			entryInode := binary.LittleEndian.Uint32(block[offset:])
+			if entryInode != 0 {
+				nameLen := int(block[offset+6])
+				name := string(block[offset+8 : offset+8+nameLen])
+
+				switch name {
+				case ".":
+					// The directory's own inode; callers re-synthesize it.
+				case "..":
+					parentInode = entryInode
+				default:
+					entries = append(entries, dirEntry{
+						Inode: entryInode,
+						Type:  block[offset+7],
+						Name:  []byte(name),
+					})
+				}
+			}
+
+			offset += int(recLen)
+		}
+	}
+
+	if parentInode == 0 {
+		return nil, 0, fmt.Errorf("directory inode %d has no .. entry", dirInode)
+	}
+
+	return entries, parentInode, nil
 }
 
 // findEntry searches for a directory entry with the specified name.

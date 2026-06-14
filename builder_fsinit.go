@@ -61,6 +61,11 @@ func (b *builder) writeSuperblock() error {
 		sb.HashSeed[i] = b.layout.CreatedAt + uint32(i*0x12345678)
 	}
 
+	// Record the seed/version we just wrote so the htree finalize path hashes
+	// names with the exact parameters the superblock advertises (decision 7).
+	b.hashSeed = sb.HashSeed
+	b.defHashVersion = sb.DefHashVersion
+
 	var buf bytes.Buffer
 	if err := binary.Write(&buf, binary.LittleEndian, sb); err != nil {
 		return fmt.Errorf("failed to encode superblock: %w", err)
