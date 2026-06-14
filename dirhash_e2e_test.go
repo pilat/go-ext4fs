@@ -76,6 +76,7 @@ while IFS= read -r n; do : > "%[4]s/%[8]s/$n"; done < /tmp/ascii_names_%[6]s
 if [ -f %[7]s ]; then while IFS= read -r n; do : > "%[4]s/%[8]s/$n"; done < %[7]s; fi
 sync
 umount %[4]s
+chmod 0666 %[1]s
 `, remoteImage, sizeMB, foreignMkfsOpts, mountDir, asciiCount, strconv.FormatInt(time.Now().UnixNano(), 10), remoteExtra, dirPath)
 
 	stdout, stderr, err := dockerExecPrivileged(t, script)
@@ -377,7 +378,7 @@ func verifyForeignLeaves(t *testing.T, p parsedHtree, created []string, hashOf f
 // =============================================================================
 
 // sameNameSet reports whether got and want contain the same names (ignoring
-// order and duplicates), and logs the difference on failure.
+// order), comparing as multisets so a duplicated name is caught, not collapsed.
 func sameNameSet(t *testing.T, got, want []string, ctx string) {
 	t.Helper()
 	gs := make(map[string]int, len(got))
@@ -388,28 +389,25 @@ func sameNameSet(t *testing.T, got, want []string, ctx string) {
 	for _, n := range want {
 		ws[n]++
 	}
-	if len(gs) != len(ws) {
-		t.Errorf("%s: got %d distinct names, want %d", ctx, len(gs), len(ws))
+	if len(got) != len(want) {
+		t.Errorf("%s: got %d names, want %d", ctx, len(got), len(want))
 	}
-	var missing, extra []string
-	for n := range ws {
-		if gs[n] == 0 {
-			missing = append(missing, n)
-		}
-	}
-	for n := range gs {
-		if ws[n] == 0 {
-			extra = append(extra, n)
+	var diff []string
+	for n, wc := range ws {
+		if gs[n] != wc {
+			diff = append(diff, fmt.Sprintf("%q (got %d, want %d)", n, gs[n], wc))
 		}
 	}
-	if len(missing) > 0 || len(extra) > 0 {
-		if len(missing) > 10 {
-			missing = missing[:10]
+	for n, gc := range gs {
+		if _, ok := ws[n]; !ok {
+			diff = append(diff, fmt.Sprintf("%q (got %d, want 0)", n, gc))
 		}
-		if len(extra) > 10 {
-			extra = extra[:10]
+	}
+	if len(diff) > 0 {
+		if len(diff) > 10 {
+			diff = diff[:10]
 		}
-		t.Errorf("%s: name-set mismatch (sample missing=%v extra=%v)", ctx, missing, extra)
+		t.Errorf("%s: name multiset mismatch (sample: %v)", ctx, diff)
 	}
 }
 

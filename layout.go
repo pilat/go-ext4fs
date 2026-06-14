@@ -286,6 +286,12 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 	if featureROCompat&roCompatMetadataCsum != 0 {
 		return nil, fmt.Errorf("metadata_csum filesystems are not supported for modification")
 	}
+	// GetGroupLayout hardcodes sparse-super backup placement; without sparse_super
+	// every group carries superblock+GDT backups, shifting the per-group metadata
+	// offsets this model computes and causing wrong-block reads on the next save.
+	if featureROCompat&roCompatSparseSuper == 0 {
+		return nil, fmt.Errorf("filesystems without sparse_super are not supported for modification")
+	}
 	if reservedGDTBlocks != 0 {
 		return nil, fmt.Errorf("filesystems with reserved GDT blocks (resize_inode) are not supported for modification")
 	}

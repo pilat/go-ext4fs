@@ -45,6 +45,7 @@ set -e
 rm -f %[1]s
 dd if=/dev/zero of=%[1]s bs=1M count=64 status=none
 mkfs.ext4 -q -F -O %[2]s -b 4096 -I 256 -N 8192 %[1]s
+chmod 0666 %[1]s
 `, remote, features)
 	stdout, stderr, err := dockerExecPrivileged(t, script)
 	if err != nil {
@@ -69,6 +70,7 @@ func TestForeignOpenRejectsUnsupported(t *testing.T) {
 	}{
 		{"metadata_csum", "dir_index,metadata_csum,^metadata_csum_seed,^resize_inode,^64bit,^flex_bg,^has_journal", "metadata_csum"},
 		{"resize_inode", "dir_index,^metadata_csum,resize_inode,^64bit,^flex_bg,^has_journal", "reserved GDT"},
+		{"sparse_super", "dir_index,^metadata_csum,^resize_inode,^sparse_super,^64bit,^flex_bg,^has_journal", "sparse_super"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,6 +108,7 @@ i=1
 while [ $i -lt 400 ]; do rm -f %[3]s/f$i; i=$((i+2)); done
 sync
 umount %[3]s
+chmod 0666 %[1]s
 `, remote, foreignMkfsOpts, mountDir)
 	stdout, stderr, err := dockerExecPrivileged(t, script)
 	if err != nil {

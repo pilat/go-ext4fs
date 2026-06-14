@@ -253,33 +253,13 @@ func (b *builder) readAllEntries(dirInode uint32) ([]dirEntry, uint32, error) {
 			return nil, 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 		}
 
-		offset := 0
-		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
-				break
-			}
-
-			entryInode := binary.LittleEndian.Uint32(block[offset:])
-			if entryInode != 0 {
-				nameLen := int(block[offset+6])
-				name := string(block[offset+8 : offset+8+nameLen])
-
-				switch name {
-				case ".":
-					// The directory's own inode; callers re-synthesize it.
-				case "..":
-					parentInode = entryInode
-				default:
-					entries = append(entries, dirEntry{
-						Inode: entryInode,
-						Type:  block[offset+7],
-						Name:  []byte(name),
-					})
-				}
-			}
-
-			offset += int(recLen)
+		blockEntries, parent, err := parseDirentBlock(block, dirInode)
+		if err != nil {
+			return nil, 0, err
+		}
+		entries = append(entries, blockEntries...)
+		if parent != 0 {
+			parentInode = parent
 		}
 	}
 
@@ -287,6 +267,50 @@ func (b *builder) readAllEntries(dirInode uint32) ([]dirEntry, uint32, error) {
 		return nil, 0, fmt.Errorf("directory inode %d has no .. entry", dirInode)
 	}
 
+	return entries, parentInode, nil
+}
+
+// parseDirentBlock returns the real entries in a directory block and the parent
+// inode if the block carries a ".." record (0 otherwise). Because it feeds the
+// destructive flatten/rebuild of foreign directories, it validates rec_len and
+// name_len against the block bounds, erroring on a malformed on-disk dirent rather
+// than slicing out of bounds and panicking.
+func parseDirentBlock(block []byte, dirInode uint32) ([]dirEntry, uint32, error) {
+	var (
+		entries     []dirEntry
+		parentInode uint32
+	)
+	for offset := 0; offset < blockSize; {
+		if offset+8 > blockSize {
+			return nil, 0, fmt.Errorf("directory inode %d: truncated dirent at offset %d", dirInode, offset)
+		}
+		recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
+		if recLen == 0 {
+			break
+		}
+		if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
+			return nil, 0, fmt.Errorf("directory inode %d: invalid rec_len %d at offset %d", dirInode, recLen, offset)
+		}
+
+		if entryInode := binary.LittleEndian.Uint32(block[offset:]); entryInode != 0 {
+			nameLen := int(block[offset+6])
+			if nameLen > recLen-8 {
+				return nil, 0, fmt.Errorf("directory inode %d: invalid name_len %d at offset %d", dirInode, nameLen, offset)
+			}
+			name := string(block[offset+8 : offset+8+nameLen])
+
+			switch name {
+			case ".":
+				// The directory's own inode; callers re-synthesize it.
+			case "..":
+				parentInode = entryInode
+			default:
+				entries = append(entries, dirEntry{Inode: entryInode, Type: block[offset+7], Name: []byte(name)})
+			}
+		}
+
+		offset += recLen
+	}
 	return entries, parentInode, nil
 }
 

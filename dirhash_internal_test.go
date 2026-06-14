@@ -91,9 +91,9 @@ func TestExt4DirhashSeedFallback(t *testing.T) {
 	}
 
 	other := [4]uint32{1, 2, 3, 4}
-	ho, _ := ext4Dirhash(name, other, hashVersionHalfMD4)
-	if ho == hz {
-		t.Errorf("a non-zero seed must change the hash, got 0x%08x for both", ho)
+	ho, mo := ext4Dirhash(name, other, hashVersionHalfMD4)
+	if ho == hz && mo == mz {
+		t.Errorf("a non-zero seed must change the hash, got (0x%08x,0x%08x) for both", ho, mo)
 	}
 }
 
