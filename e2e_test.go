@@ -25,8 +25,8 @@ import (
 // =============================================================================
 
 const (
-	// Docker image to use for ext4 validation
-	dockerImage = "alpine:latest"
+	// Docker image to use for ext4 validation (pinned for reproducible CI)
+	dockerImage = "alpine:3.21"
 	// Default test image size in MB
 	defaultImageSizeMB = 64
 
