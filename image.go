@@ -104,12 +104,6 @@ func Open(opts ...ImageOption) (*Image, error) {
 	img.createdAt = layout.CreatedAt
 	img.builder = newBuilder(img.backend, layout)
 
-	// Adopt the image's own directory-hash parameters so htree maintenance never
-	// substitutes our seed or signedness into a foreign image (decision 4/7).
-	img.builder.hashSeed = layout.HashSeed
-	img.builder.defHashVersion = layout.DefHashVersion
-	img.builder.signedHash = !layout.UnsignedHash
-
 	// Load allocation bitmaps into memory
 	if err := img.builder.loadBitmaps(); err != nil {
 		_ = img.backend.close()
@@ -218,12 +212,6 @@ func (e *Image) Resize(targetBytes uint64) error {
 // This includes finalizing the metadata, syncing the image, and closing the backend.
 // Returns an error if the operation fails.
 func (e *Image) Save() error {
-	// Emit htree directories before finalize: indexing may allocate blocks, and
-	// finalizeMetadata computes the final free-block counts (decision 6).
-	if err := e.builder.emitHtreeDirs(); err != nil {
-		return fmt.Errorf("failed to emit htree directories: %w", err)
-	}
-
 	if err := e.builder.finalizeMetadata(); err != nil {
 		return fmt.Errorf("failed to finalize metadata: %w", err)
 	}

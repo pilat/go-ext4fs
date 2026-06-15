@@ -204,6 +204,9 @@ func (b *builder) allocateInode() (uint32, error) {
 		inodeNum := b.freeInodeList[len(b.freeInodeList)-1]
 		b.freeInodeList = b.freeInodeList[:len(b.freeInodeList)-1]
 
+		group := (inodeNum - 1) / inodesPerGroup
+		b.freedInodesPerGroup[group]--
+
 		if err := b.setInodeBit(inodeNum); err != nil {
 			return 0, fmt.Errorf("failed to mark reused inode as used: %w", err)
 		}
@@ -235,6 +238,8 @@ func (b *builder) freeInode(inodeNum uint32) error {
 		return err
 	}
 
+	group := (inodeNum - 1) / inodesPerGroup
+	b.freedInodesPerGroup[group]++
 	b.freeInodeList = append(b.freeInodeList, inodeNum)
 
 	return nil
