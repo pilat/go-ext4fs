@@ -120,10 +120,10 @@ func TestDirScannersRejectWalkPastBlockEnd(t *testing.T) {
 	})
 
 	t.Run("tryAddEntryToBlock", func(t *testing.T) {
-		b, dInode, blockNum := corrupt(t)
+		b, _, blockNum := corrupt(t)
 		entry := dirEntry{Inode: 11, Type: ftRegFile, Name: []byte("zz")}
 		var err error
-		require.NotPanics(t, func() { _, err = b.tryAddEntryToBlock(blockNum, dInode, 0, entry, dirRecLen(2)) })
+		require.NotPanics(t, func() { _, err = b.tryAddEntryToBlock(blockNum, entry, dirRecLen(2)) })
 		require.Error(t, err)
 	})
 }

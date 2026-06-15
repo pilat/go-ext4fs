@@ -35,12 +35,6 @@ type builder struct {
 	// createDirectory; foreign htree directories register on their first mutation.
 	reindexDirs map[uint32]reindexInfo
 
-	// metadata_csum state. csumEnabled gates every checksum behavior; csumSeed is
-	// the FS-wide seed derived from the UUID (in writeSuperblock for New, from the
-	// on-disk UUID for Open) and chained into the GD, bitmap, inode, and dir csums.
-	csumEnabled bool
-	csumSeed    uint32
-
 	// Allocation state - per group
 	nextBlockPerGroup   []uint32  // Next free block in each group
 	freedBlocksPerGroup []uint32  // Blocks freed per group (for overwrites)

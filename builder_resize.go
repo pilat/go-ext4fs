@@ -85,10 +85,6 @@ func (b *builder) minBlocks() uint32 {
 // following Save (finalizeMetadata); the supported flows always Save afterward.
 // All rejections happen before any write, so on error the image is unchanged.
 func (b *builder) resize(targetBytes uint64) error {
-	if b.csumEnabled {
-		return csumUnsupported("resize")
-	}
-
 	targetBlocks, err := b.validateResize(targetBytes)
 	if err != nil {
 		return err

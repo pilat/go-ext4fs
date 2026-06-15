@@ -20,40 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to an indexed directory now flattens and rebuilds its index with the image's
   own hash seed and signedness instead of overwriting it; deletes are left as the
   kernel does, untouched.
-- `WithChecksum()` option to write `metadata_csum` images. When enabled, every
-  superblock, group descriptor, block/inode bitmap, inode, and directory block
-  carries a valid CRC32C checksum, so `e2fsck` and a real kernel accept the image
-  with the `metadata_csum` feature. It is off by default and the default output is
-  byte-for-byte unchanged; reopening a checksummed image and appending to it keeps
-  the checksums valid. Directories under `metadata_csum` stay linear (htree's
-  `dx_tail` index checksum is not yet written); mutating an existing htree
-  directory, extended attributes, external extent trees and resize are refused
-  rather than emit an image `e2fsck` would fault.
-- `Open` now accepts foreign `metadata_csum` images of matching geometry, including
-  stock `mke2fs` images that store the checksum seed explicitly
-  (`metadata_csum_seed`) — even after a `tune2fs -U` has decoupled the seed from
-  the UUID.
-- Fuzz target (`FuzzChecksumOps`) driving a checksummed image through arbitrary
-  operation sequences and a reopen cycle, asserting every metadata checksum stays
-  self-consistent and the free-block counts match the bitmaps.
-
-### Changed
-
-- `Open` now decides reopen acceptance from a feature whitelist and refuses any
-  image it cannot correctly rewrite: an unsupported RO_COMPAT feature (gdt_csum,
-  bigalloc, quota) or reserved GDT blocks (the online-resize `resize_inode` layout).
-  `metadata_csum` is the one formerly-refused feature now accepted, because its
-  checksums are maintained on every write.
 
 ### Fixed
 
 - Adding an entry to a hash-indexed directory previously overwrote its dx_root
   index on the first insert — a silent corruption reachable once `Open` accepted
   foreign images. Such inserts now flatten the directory and re-index it at save.
-- The free-inode and free-block counts are now correct after reopening an image
-  whose directory entries or files were deleted by a previous session or the
-  kernel (inodes and blocks freed below the allocation high-water mark were
-  previously miscounted as used, producing counts `e2fsck` rejects).
+- The free-inode count is now correct after reopening an image whose directory
+  entries were deleted by a previous session or the kernel (inodes freed below
+  the allocation high-water mark were previously miscounted as used).
+- `Open` now refuses images carrying `metadata_csum` or reserved GDT blocks
+  (`resize_inode`) instead of silently mis-reading and corrupting them on save.
 
 ## [1.0.1] - 2026-06-10
 

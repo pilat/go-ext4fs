@@ -56,7 +56,7 @@ func (b *builder) createDirectory(parentInode uint32, name string, mode, uid, gi
 		{Inode: inodeNum, Type: ftDir, Name: []byte(".")},
 		{Inode: parentInode, Type: ftDir, Name: []byte("..")},
 	}
-	if err := b.writeDirBlock(dataBlock, inodeNum, inode.Generation, entries); err != nil {
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
 		return 0, err
 	}
 
@@ -168,12 +168,6 @@ func (b *builder) allocateAndWriteFileContent(inode inode, content []byte) (inod
 		b.setExtent(&inode, 0, blocks[0], 1)
 	} else {
 		if err := b.setExtentMultiple(&inode, blocks); err != nil {
-			// setExtentMultiple can reject (e.g. the metadata_csum guard on an
-			// external extent tree); roll back the just-allocated blocks so a
-			// rejected write leaves no orphaned allocation behind.
-			if freeErr := b.freeBlocks(blocks); freeErr != nil {
-				return inode, nil, fmt.Errorf("%w (allocation rollback failed: %v)", err, freeErr)
-			}
 			return inode, nil, err
 		}
 	}
@@ -262,15 +256,6 @@ func (b *builder) updateGroupDescriptor(g uint32, freeBlocks, freeInodes, usedDi
 	binary.LittleEndian.PutUint16(gdBuf[18:20], 0) // Flags
 	binary.LittleEndian.PutUint16(gdBuf[28:30], itableUnused)
 
-	// metadata_csum: fill the bitmap checksums (inside the descriptor's covered
-	// range) BEFORE the descriptor's own bg_checksum. Done here so the same
-	// checksummed buffer is mirrored to every backup below.
-	if b.csumEnabled {
-		if err := b.setGroupDescChecksums(g, gdBuf); err != nil {
-			return err
-		}
-	}
-
 	if err := b.disk.writeAt(gdBuf, int64(gdOffset)); err != nil {
 		return fmt.Errorf("failed to write group descriptor for group %d: %w", g, err)
 	}
@@ -286,31 +271,6 @@ func (b *builder) updateGroupDescriptor(g uint32, freeBlocks, freeInodes, usedDi
 			}
 		}
 	}
-
-	return nil
-}
-
-// setGroupDescChecksums fills the metadata_csum fields of a group descriptor
-// buffer in coverage order: the block-bitmap checksum (0x18) and inode-bitmap
-// checksum (0x1A) first, since both live inside the descriptor's covered range,
-// then bg_checksum (0x1E) over the whole descriptor. The bitmaps are read back from
-// disk (the allocator writes them one byte at a time, so there is no in-memory copy).
-func (b *builder) setGroupDescChecksums(g uint32, gdBuf []byte) error {
-	gl := b.layout.GetGroupLayout(g)
-
-	blockBitmap := make([]byte, blockSize)
-	if err := b.disk.readAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock))); err != nil {
-		return fmt.Errorf("failed to read block bitmap for group %d checksum: %w", g, err)
-	}
-	binary.LittleEndian.PutUint16(gdBuf[0x18:], bitmapCsum(b.csumSeed, blockBitmap))
-
-	inodeBitmap := make([]byte, (inodesPerGroup+7)/8)
-	if err := b.disk.readAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
-		return fmt.Errorf("failed to read inode bitmap for group %d checksum: %w", g, err)
-	}
-	binary.LittleEndian.PutUint16(gdBuf[0x1A:], bitmapCsum(b.csumSeed, inodeBitmap))
-
-	binary.LittleEndian.PutUint16(gdBuf[0x1E:], groupDescCsum(b.csumSeed, g, gdBuf))
 
 	return nil
 }
@@ -350,14 +310,6 @@ func (b *builder) patchSuperblockCounts(sbBuf []byte, freeBlocks, freeInodes uin
 	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], freeBlocks)
 	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], freeInodes)
 	b.applyDirIndexFlags(sbBuf)
-
-	// metadata_csum: the SB checksum is computed LAST, over the final image (the
-	// free counts and the dir_index/signedness flags above are inside its covered
-	// [0:0x3FC] range). Recomputed per copy, so each backup's own s_block_group_nr
-	// is covered.
-	if b.csumEnabled {
-		binary.LittleEndian.PutUint32(sbBuf[0x3FC:], superblockCsum(sbBuf))
-	}
 }
 
 // updateSuperblocks updates the primary and backup superblocks with total free blocks and inodes.
@@ -704,10 +656,6 @@ func (b *builder) deleteDirectory(parentInode uint32, name string) error {
 // beyond standard file attributes. Names use namespace prefixes like "user.",
 // "trusted.", "security.", or "system.". If the xattr already exists, its value is updated.
 func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
-	if b.csumEnabled {
-		return csumUnsupported("xattrs")
-	}
-
 	if len(name) == 0 {
 		return fmt.Errorf("xattr name cannot be empty")
 	}
@@ -752,7 +700,25 @@ func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
 		inode.BlocksLo += blockSize / 512
 	}
 
-	entries = upsertXattr(entries, nameIndex, shortName, value)
+	// Update existing or add new entry
+	found := false
+
+	for i, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			entries[i].Value = value
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		entries = append(entries, xAttrEntry{
+			NameIndex: nameIndex,
+			Name:      shortName,
+			Value:     value,
+		})
+	}
 
 	if err := b.writeXattrBlock(xattrBlock, entries); err != nil {
 		return err
@@ -801,10 +767,6 @@ func (b *builder) listXattrs(inodeNum uint32) ([]string, error) {
 // If the attribute doesn't exist, no error is returned (idempotent operation).
 // The xattr block may be deallocated if it becomes empty after removal.
 func (b *builder) removeXattr(inodeNum uint32, name string) error {
-	if b.csumEnabled {
-		return csumUnsupported("xattrs")
-	}
-
 	nameIndex, shortName, err := parseXattrName(name)
 	if err != nil {
 		return err

@@ -13,11 +13,10 @@ type Image struct {
 	builder *builder    // Internal filesystem builder
 	backend diskBackend // File-based storage backend
 
-	imagePath   string // Path to the output image file
-	sizeBytes   uint64 // Image size in Bytes
-	createdAt   uint32 // Creation timestamp
-	label       string // Volume label written to the superblock
-	csumEnabled bool   // Emit metadata_csum checksums (WithChecksum)
+	imagePath string // Path to the output image file
+	sizeBytes uint64 // Image size in Bytes
+	createdAt uint32 // Creation timestamp
+	label     string // Volume label written to the superblock
 }
 
 // New creates a new ext4 filesystem image with the provided options.
@@ -51,7 +50,6 @@ func New(opts ...ImageOption) (*Image, error) {
 	img.builder = newBuilder(img.backend, layout)
 	img.builder.label = img.label
 	img.builder.skipZeroInit = true // freshly truncated image reads back as zero
-	img.builder.csumEnabled = img.csumEnabled
 
 	if err := img.backend.truncate(int64(img.sizeBytes)); err != nil {
 		return nil, fmt.Errorf("failed to truncate image file: %w", err)
@@ -111,13 +109,6 @@ func Open(opts ...ImageOption) (*Image, error) {
 	img.builder.hashSeed = layout.HashSeed
 	img.builder.defHashVersion = layout.DefHashVersion
 	img.builder.signedHash = !layout.UnsignedHash
-
-	// Carry forward metadata_csum so post-reopen writes keep maintaining checksums
-	// using the seed re-derived (or read) from the on-disk superblock. The checksum
-	// mode is always taken from the image; any WithChecksum() passed to Open is
-	// ignored, since a foreign image's checksum state cannot be retrofitted on reopen.
-	img.builder.csumEnabled = layout.CsumEnabled
-	img.builder.csumSeed = layout.CsumSeed
 
 	// Load allocation bitmaps into memory
 	if err := img.builder.loadBitmaps(); err != nil {

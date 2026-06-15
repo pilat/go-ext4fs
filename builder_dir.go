@@ -5,44 +5,12 @@ import (
 	"fmt"
 )
 
-// dirUsableEnd returns the byte offset at which real directory entries must stop.
-// With metadata_csum the trailing 12 bytes are reserved for the ext4_dir_entry_tail,
-// so the last real entry's rec_len ends at blockSize-12; without it entries fill the
-// whole block.
-func (b *builder) dirUsableEnd() int {
-	if b.csumEnabled {
-		return blockSize - dirEntryTailSize
-	}
-
-	return blockSize
-}
-
-// setDirTail stamps the ext4_dir_entry_tail into the last 12 bytes of a directory
-// block and fills its det_checksum. It masquerades as a deleted entry (inode 0,
-// rec_len 12, name_len 0, file_type 0xDE) so the linear readers skip it. The caller
-// must have laid out real entries so the last one's rec_len ends at
-// blockSize-dirEntryTailSize. Only called when csumEnabled.
-func (b *builder) setDirTail(block []byte, dirInode, dirGen uint32) {
-	off := blockSize - dirEntryTailSize
-
-	binary.LittleEndian.PutUint32(block[off:], 0)                  // det_reserved_zero1 (inode)
-	binary.LittleEndian.PutUint16(block[off+4:], dirEntryTailSize) // det_rec_len
-	block[off+6] = 0                                               // det_reserved_zero2 (name_len)
-	block[off+7] = dirEntryTailType                                // det_reserved_ft
-
-	csum := dirBlockCsum(b.csumSeed, dirInode, dirGen, block)
-	binary.LittleEndian.PutUint32(block[blockSize-4:], csum)
-}
-
 // writeDirBlock writes a block containing directory entries to disk.
 // Directory entries are packed into the block with proper record length calculations
 // to ensure correct parsing. The block becomes part of the directory's data extent.
-// dirInode and dirGen identify the owning directory; with metadata_csum they sign the
-// block's ext4_dir_entry_tail checksum (ignored when checksums are off).
-func (b *builder) writeDirBlock(blockNum, dirInode, dirGen uint32, entries []dirEntry) error {
+func (b *builder) writeDirBlock(blockNum uint32, entries []dirEntry) error {
 	block := make([]byte, blockSize)
 	offset := 0
-	usableEnd := b.dirUsableEnd()
 
 	for i, entry := range entries {
 		nameLen := len(entry.Name)
@@ -50,7 +18,7 @@ func (b *builder) writeDirBlock(blockNum, dirInode, dirGen uint32, entries []dir
 		recLen := dirRecLen(nameLen)
 
 		if i == len(entries)-1 {
-			recLen = usableEnd - offset
+			recLen = blockSize - offset
 		}
 
 		binary.LittleEndian.PutUint32(block[offset:], entry.Inode)
@@ -60,10 +28,6 @@ func (b *builder) writeDirBlock(blockNum, dirInode, dirGen uint32, entries []dir
 		copy(block[offset+8:], entry.Name)
 
 		offset += recLen
-	}
-
-	if b.csumEnabled {
-		b.setDirTail(block, dirInode, dirGen)
 	}
 
 	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
@@ -83,14 +47,10 @@ func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 	}
 
 	// htree guard: a linear insert into a hash-indexed directory would overwrite
-	// its dx_root index (the corruption this whole feature fixes). With metadata_csum
-	// we cannot maintain the index's dx_tail checksums, so we refuse rather than
-	// flatten; otherwise, on the first such insert, flatten the directory to linear
-	// and queue it for re-index at finalize, then fall through to the linear insert.
+	// its dx_root index (the corruption this whole feature fixes). On the first
+	// such insert, flatten the directory to linear and queue it for re-index at
+	// finalize; then fall through to the ordinary linear insert below.
 	if inode.Flags&inodeFlagIndex != 0 {
-		if b.csumEnabled {
-			return csumUnsupported("htree directory")
-		}
 		if err := b.prepareHtreeForMutation(dirInode); err != nil {
 			return err
 		}
@@ -100,8 +60,6 @@ func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 		}
 	}
 
-	dirGen := inode.Generation
-
 	dataBlocks, err := b.getInodeBlocks(inode)
 	if err != nil {
 		return fmt.Errorf("failed to get directory blocks: %w", err)
@@ -110,54 +68,41 @@ func (b *builder) addDirEntry(dirInode uint32, entry dirEntry) error {
 	newRecLen := dirRecLen(len(entry.Name))
 
 	for _, blockNum := range dataBlocks {
-		if success, err := b.tryAddEntryToBlock(blockNum, dirInode, dirGen, entry, newRecLen); err != nil {
+		if success, err := b.tryAddEntryToBlock(blockNum, entry, newRecLen); err != nil {
 			return fmt.Errorf("failed to add entry to directory block %d: %w", blockNum, err)
 		} else if success {
 			return nil
 		}
 	}
 
-	return b.appendEntryInNewBlock(dirInode, dirGen, entry)
-}
-
-// appendEntryInNewBlock grows the directory by one data block and writes entry as
-// its sole record, then updates the inode's size and block count. dirGen stamps the
-// metadata_csum directory tail. A mutation rejected after allocation (e.g. the
-// metadata_csum external-extent guard) rolls the new block back so none is orphaned.
-func (b *builder) appendEntryInNewBlock(dirInode, dirGen uint32, entry dirEntry) error {
+	// Allocate new block
 	newBlock, err := b.allocateBlock()
 	if err != nil {
 		return err
 	}
 
 	if err := b.addBlockToInode(dirInode, newBlock); err != nil {
-		if freeErr := b.freeBlockRun(newBlock, 1); freeErr != nil {
-			return fmt.Errorf("%w (allocation rollback failed: %v)", err, freeErr)
-		}
 		return err
 	}
 
 	block := make([]byte, blockSize)
 	binary.LittleEndian.PutUint32(block[0:], entry.Inode)
-	binary.LittleEndian.PutUint16(block[4:], uint16(b.dirUsableEnd()))
+	binary.LittleEndian.PutUint16(block[4:], uint16(blockSize))
 	block[6] = uint8(len(entry.Name))
 	block[7] = entry.Type
 	copy(block[8:], entry.Name)
-
-	if b.csumEnabled {
-		b.setDirTail(block, dirInode, dirGen)
-	}
 
 	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(newBlock))); err != nil {
 		return fmt.Errorf("failed to write directory block: %w", err)
 	}
 
-	inode, err := b.readInode(dirInode)
+	inode, err = b.readInode(dirInode)
 	if err != nil {
 		return fmt.Errorf("failed to re-read directory inode: %w", err)
 	}
 
 	inode.SizeLo += blockSize
+
 	inode.BlocksLo += blockSize / 512
 	if err := b.writeInode(dirInode, inode); err != nil {
 		return fmt.Errorf("failed to update directory inode: %w", err)
@@ -169,21 +114,16 @@ func (b *builder) appendEntryInNewBlock(dirInode, dirGen uint32, entry dirEntry)
 // tryAddEntryToBlock attempts to add a directory entry to an existing directory block.
 // Returns true if the entry fits in the available space, false if the block is full.
 // Calculates proper record lengths to maintain directory entry structure integrity.
-func (b *builder) tryAddEntryToBlock(blockNum, dirInode, dirGen uint32, entry dirEntry, newRecLen int) (bool, error) {
+func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen int) (bool, error) {
 	block := make([]byte, blockSize)
 	if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return false, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 	}
 
-	// With metadata_csum the trailing 12 bytes are the ext4_dir_entry_tail; the scan
-	// stops at it, the new last entry's rec_len ends there, and the tail's
-	// det_checksum is rewritten below.
-	usableEnd := b.dirUsableEnd()
-
 	offset := 0
 	lastOffset := 0
 
-	for offset < usableEnd {
+	for offset < blockSize {
 		// Validate the record before walking past it, matching walkDirentBlock;
 		// the in-place mutation below cannot delegate to it.
 		if offset+8 > blockSize {
@@ -205,8 +145,6 @@ func (b *builder) tryAddEntryToBlock(blockNum, dirInode, dirGen uint32, entry di
 
 	lastRecLen := int(binary.LittleEndian.Uint16(block[lastOffset+4:]))
 
-	// lastRecLen extends to usableEnd, so spaceAvailable already excludes the
-	// reserved tail; no separate reservation is needed in the block-full math.
 	spaceAvailable := lastRecLen - lastActualSize
 	if spaceAvailable < newRecLen {
 		return false, nil
@@ -215,17 +153,13 @@ func (b *builder) tryAddEntryToBlock(blockNum, dirInode, dirGen uint32, entry di
 	binary.LittleEndian.PutUint16(block[lastOffset+4:], uint16(lastActualSize))
 
 	newOffset := lastOffset + lastActualSize
-	remaining := usableEnd - newOffset
+	remaining := blockSize - newOffset
 
 	binary.LittleEndian.PutUint32(block[newOffset:], entry.Inode)
 	binary.LittleEndian.PutUint16(block[newOffset+4:], uint16(remaining))
 	block[newOffset+6] = uint8(len(entry.Name))
 	block[newOffset+7] = entry.Type
 	copy(block[newOffset+8:], entry.Name)
-
-	if b.csumEnabled {
-		b.setDirTail(block, dirInode, dirGen)
-	}
 
 	if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
 		return false, fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
@@ -244,15 +178,6 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 		return fmt.Errorf("failed to read directory inode for entry removal: %w", err)
 	}
 
-	// With metadata_csum we cannot maintain an htree directory's dx_tail checksums,
-	// so refuse to mutate an indexed directory rather than corrupt its index.
-	if b.csumEnabled && inode.Flags&inodeFlagIndex != 0 {
-		return csumUnsupported("htree directory")
-	}
-
-	dirGen := inode.Generation
-	usableEnd := b.dirUsableEnd()
-
 	dataBlocks, err := b.getInodeBlocks(inode)
 	if err != nil {
 		return fmt.Errorf("failed to get directory blocks for entry removal: %w", err)
@@ -264,72 +189,52 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 			return fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 		}
 
-		found, err := removeEntryFromBlock(block, name, usableEnd)
-		if err != nil {
-			return fmt.Errorf("directory inode %d, block %d: %w", dirInode, blockNum, err)
-		}
-		if !found {
-			continue
-		}
+		offset := 0
+		prevOffset := -1
 
-		if b.csumEnabled {
-			b.setDirTail(block, dirInode, dirGen)
-		}
+		for offset < blockSize {
+			// Validate the record before slicing or mutating, matching
+			// walkDirentBlock; the mutation below cannot delegate to it.
+			if offset+8 > blockSize {
+				return fmt.Errorf("directory inode %d, block %d: truncated dirent at offset %d", dirInode, blockNum, offset)
+			}
+			recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
+			if recLen == 0 {
+				break
+			}
+			if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
+				return fmt.Errorf("directory inode %d, block %d: invalid rec_len %d at offset %d", dirInode, blockNum, recLen, offset)
+			}
 
-		if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
-			return fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
-		}
+			nameLen := int(block[offset+6])
+			if nameLen > recLen-8 {
+				return fmt.Errorf("directory inode %d, block %d: invalid name_len %d at offset %d", dirInode, blockNum, nameLen, offset)
+			}
+			entryName := string(block[offset+8 : offset+8+nameLen])
 
-		return nil
+			if entryName == name {
+				if prevOffset < 0 {
+					// First entry in block: set inode to 0 to mark as unused
+					binary.LittleEndian.PutUint32(block[offset:], 0)
+				} else {
+					// Not first entry: expand previous entry's rec_len
+					prevRecLen := binary.LittleEndian.Uint16(block[prevOffset+4:])
+					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+uint16(recLen))
+				}
+
+				if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+					return fmt.Errorf("failed to write directory block %d: %w", blockNum, err)
+				}
+
+				return nil
+			}
+
+			prevOffset = offset
+			offset += recLen
+		}
 	}
 
 	return fmt.Errorf("entry %q not found in directory", name)
-}
-
-// removeEntryFromBlock scans a single directory data block for name and, if
-// present, removes the entry in place — zeroing the first record's inode or
-// extending the previous record's rec_len to absorb it — and returns true.
-// usableEnd excludes any metadata_csum tail. Each record is validated like
-// walkDirentBlock before it is walked, since the in-place mutation cannot delegate.
-func removeEntryFromBlock(block []byte, name string, usableEnd int) (bool, error) {
-	offset := 0
-	prevOffset := -1
-
-	for offset < usableEnd {
-		if offset+8 > blockSize {
-			return false, fmt.Errorf("truncated dirent at offset %d", offset)
-		}
-		recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
-		if recLen == 0 {
-			break
-		}
-		if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
-			return false, fmt.Errorf("invalid rec_len %d at offset %d", recLen, offset)
-		}
-
-		nameLen := int(block[offset+6])
-		if nameLen > recLen-8 {
-			return false, fmt.Errorf("invalid name_len %d at offset %d", nameLen, offset)
-		}
-
-		if string(block[offset+8:offset+8+nameLen]) == name {
-			if prevOffset < 0 {
-				// First entry in block: set inode to 0 to mark as unused.
-				binary.LittleEndian.PutUint32(block[offset:], 0)
-			} else {
-				// Not first entry: expand previous entry's rec_len. The removed
-				// entry ends at or before usableEnd, so this never swallows the tail.
-				prevRecLen := binary.LittleEndian.Uint16(block[prevOffset+4:])
-				binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+uint16(recLen))
-			}
-			return true, nil
-		}
-
-		prevOffset = offset
-		offset += recLen
-	}
-
-	return false, nil
 }
 
 // readAllEntries enumerates every real entry of a directory and recovers the

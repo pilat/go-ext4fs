@@ -55,16 +55,6 @@ func (b *builder) writeSuperblock() error {
 	sb.UUID[6] = (sb.UUID[6] & 0x0F) | 0x40 // Version 4
 	sb.UUID[8] = (sb.UUID[8] & 0x3F) | 0x80 // Variant RFC 4122
 
-	// Derive the FS-wide checksum seed from the freshly generated UUID, before any
-	// inode or directory block is written. The feature bit and checksum type are set
-	// on the primary and every backup (the loop below re-marshals this struct); the
-	// SB checksum itself is filled in the finalize pass once free counts are final.
-	if b.csumEnabled {
-		b.csumSeed = deriveCsumSeed(sb.UUID[:])
-		sb.FeatureROCompat |= roCompatMetadataCsum
-		sb.ChecksumType = checksumTypeCRC32C
-	}
-
 	copy(sb.VolumeName[:], b.label)
 
 	for i := 0; i < 4; i++ {
@@ -308,7 +298,7 @@ func (b *builder) createRootDirectory() error {
 		{Inode: RootInode, Type: ftDir, Name: []byte(".")},
 		{Inode: RootInode, Type: ftDir, Name: []byte("..")},
 	}
-	if err := b.writeDirBlock(dataBlock, RootInode, inode.Generation, entries); err != nil {
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
 		return fmt.Errorf("failed to write root directory block: %w", err)
 	}
 
@@ -355,7 +345,7 @@ func (b *builder) createLostFound() error {
 		{Inode: inodeNum, Type: ftDir, Name: []byte(".")},
 		{Inode: RootInode, Type: ftDir, Name: []byte("..")},
 	}
-	if err := b.writeDirBlock(dataBlock, inodeNum, inode.Generation, entries); err != nil {
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
 		return fmt.Errorf("failed to write lost+found directory block: %w", err)
 	}
 

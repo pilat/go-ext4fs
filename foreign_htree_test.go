@@ -56,12 +56,11 @@ chmod 0666 %[1]s
 }
 
 // TestForeignOpenRejectsUnsupported verifies the safety reject-guard: a reopened
-// image carrying an unmaintainable ro_compat feature (uninit_bg/gdt_csum), reserved
-// GDT blocks (resize_inode), or no sparse_super is refused rather than silently
-// mis-read and corrupted on the next Save. Each image otherwise passes the geometry
-// and incompat checks, so they exercise these guards specifically. (metadata_csum is
-// NOT here — its checksums are maintained on write, so such images are accepted; see
-// the WithChecksum reopen tests.)
+// image carrying an unmaintainable ro_compat feature (metadata_csum, uninit_bg/
+// gdt_csum), reserved GDT blocks (resize_inode), or no sparse_super is refused
+// rather than silently mis-read and corrupted on the next Save. Each image
+// otherwise passes the geometry and incompat checks, so they exercise these guards
+// specifically.
 func TestForeignOpenRejectsUnsupported(t *testing.T) {
 	skipIfNoDocker(t)
 
@@ -70,6 +69,7 @@ func TestForeignOpenRejectsUnsupported(t *testing.T) {
 		features string
 		wantErr  string
 	}{
+		{"metadata_csum", "dir_index,metadata_csum,^metadata_csum_seed,^resize_inode,^64bit,^flex_bg,^has_journal", "metadata_csum"},
 		{"uninit_bg", "dir_index,uninit_bg,^metadata_csum,^resize_inode,^64bit,^flex_bg,^has_journal", "uninit_bg"},
 		{"resize_inode", "dir_index,^metadata_csum,resize_inode,^64bit,^flex_bg,^has_journal", "reserved GDT"},
 		{"sparse_super", "dir_index,^metadata_csum,^resize_inode,^sparse_super,^64bit,^flex_bg,^has_journal", "sparse_super"},

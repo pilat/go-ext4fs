@@ -140,14 +140,6 @@ func liveEntryBytes(entries []dirEntry) int {
 // propagate, so finalizeMetadata always runs and every directory in the final
 // image is valid.
 func (b *builder) emitHtreeDirs() error {
-	// metadata_csum defers htree (the dx_tail index checksums are not implemented),
-	// so under WithChecksum own directories stay linear multi-block — valid with a
-	// det_checksum per leaf block. Foreign htree mutation is refused upstream in
-	// addDirEntry/removeDirEntry, so reindexDirs holds only own dirs here.
-	if b.csumEnabled {
-		return nil
-	}
-
 	inodes := make([]uint32, 0, len(b.reindexDirs))
 	for ino := range b.reindexDirs {
 		inodes = append(inodes, ino)
@@ -327,7 +319,7 @@ func (b *builder) commitHtreeLayout(dirInode uint32, inode *inode, parentInode u
 
 	// Write leaves (logical blocks 1..K -> physical blocks[1..K]).
 	for i, leaf := range leaves {
-		if err := b.writeDirBlock(blocks[i+1], dirInode, inode.Generation, leaf.entries); err != nil {
+		if err := b.writeDirBlock(blocks[i+1], leaf.entries); err != nil {
 			return fmt.Errorf("failed to write htree leaf %d: %w", i, err)
 		}
 	}
@@ -567,7 +559,7 @@ func (b *builder) flattenHtree(dirInode uint32) error {
 	}
 
 	for i, be := range blocksEntries {
-		if err := b.writeDirBlock(blocks[i], dirInode, inode.Generation, be); err != nil {
+		if err := b.writeDirBlock(blocks[i], be); err != nil {
 			return fmt.Errorf("failed to write flattened directory block %d: %w", i, err)
 		}
 	}
