@@ -40,7 +40,6 @@ type builder struct {
 	freedBlocksPerGroup []uint32  // Blocks freed per group (for overwrites)
 	freeRuns            []freeRun // Free block runs sorted by count (ascending) for best-fit
 	nextInode           uint32    // Next free inode (global)
-	freedInodesPerGroup []uint32  // Inodes freed per group (for deletes)
 	freeInodeList       []uint32  // List of freed inodes available for reuse
 
 	// Tracking
@@ -68,7 +67,6 @@ func newBuilder(disk diskBackend, layout *Layout) *builder {
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeRuns:            nil,
 		nextInode:           firstNonResInode,
-		freedInodesPerGroup: make([]uint32, layout.GroupCount),
 		freeInodeList:       make([]uint32, 0),
 		usedDirsPerGroup:    make([]uint16, layout.GroupCount),
 		defHashVersion:      hashVersionHalfMD4,
@@ -105,16 +103,13 @@ func (b *builder) loadBitmaps() error {
 			return err
 		}
 
-		groupHighest, holes, err := b.loadInodeBitmap(g, gl)
+		groupHighest, err := b.loadInodeBitmap(g, gl)
 		if err != nil {
 			return err
 		}
 		if groupHighest > highestInode {
 			highestInode = groupHighest
 		}
-		// Free inodes below the high-water mark are not reachable through
-		// nextInode; record them so the free-inode count is correct on Save.
-		b.freedInodesPerGroup[g] = holes
 
 		if err := b.loadGroupDirCount(g); err != nil {
 			return err
@@ -149,9 +144,9 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 
 	// Find free block runs (holes) below the high-water mark. They are reusable
 	// (added to freeRuns) and also recorded as freed so the free-block count is
-	// correct on a foreign image whose deleted files left holes — symmetric to the
-	// inode-hole accounting in loadInodeBitmap. For our own images (sequential
-	// allocation, no holes) this is zero, leaving the count unchanged.
+	// correct on a foreign image whose deleted files left holes. For our own
+	// images (sequential allocation, no holes) this is zero, leaving the count
+	// unchanged.
 	var runStart, runCount, holes uint32
 	for i := dataStart; i <= highestUsed; i++ {
 		isFree := blockBitmap[i/8]&(1<<(i%8)) == 0
@@ -176,30 +171,25 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 }
 
 // loadInodeBitmap scans a group's inode bitmap and returns the highest allocated
-// inode plus the number of free inodes below that high-water mark (holes). Holes
-// arise when a prior session or the kernel deleted files; they are free but not
-// reachable through nextInode, so the caller records them as freed so the
-// free-inode count stays correct for foreign images that had deletions.
-func (b *builder) loadInodeBitmap(g uint32, gl GroupLayout) (highest, holes uint32, err error) {
+// inode (0 if the group has none), used to seed the global nextInode cursor.
+// Per-group inode usage is recomputed directly from the bitmap at finalize
+// (calculateGroupStats), so no free-inode "holes" accounting is needed here.
+func (b *builder) loadInodeBitmap(g uint32, gl GroupLayout) (highest uint32, err error) {
 	inodeBitmap := make([]byte, blockSize)
 	if err := b.disk.readAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
-		return 0, 0, fmt.Errorf("read inode bitmap for group %d: %w", g, err)
+		return 0, fmt.Errorf("read inode bitmap for group %d: %w", g, err)
 	}
 
 	highestIndex := -1
-	var used uint32
 	for i := uint32(0); i < b.layout.InodesPerGroup; i++ {
 		if inodeBitmap[i/8]&(1<<(i%8)) != 0 {
 			highestIndex = int(i)
-			used++
 		}
 	}
 	if highestIndex < 0 {
-		return 0, 0, nil
+		return 0, nil
 	}
-	highest = g*b.layout.InodesPerGroup + uint32(highestIndex) + 1
-	holes = uint32(highestIndex+1) - used
-	return highest, holes, nil
+	return g*b.layout.InodesPerGroup + uint32(highestIndex) + 1, nil
 }
 
 // loadGroupDirCount reads the directory count from a group descriptor.
