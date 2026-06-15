@@ -85,10 +85,6 @@ func (b *builder) minBlocks() uint32 {
 // following Save (finalizeMetadata); the supported flows always Save afterward.
 // All rejections happen before any write, so on error the image is unchanged.
 func (b *builder) resize(targetBytes uint64) error {
-	if b.csumEnabled {
-		return csumUnsupported("resize")
-	}
-
 	targetBlocks, err := b.validateResize(targetBytes)
 	if err != nil {
 		return err
@@ -239,11 +235,13 @@ func (b *builder) extendAllocState(oldGroupCount uint32) {
 
 	b.nextBlockPerGroup = fitSlice(b.nextBlockPerGroup, n)
 	b.freedBlocksPerGroup = fitSlice(b.freedBlocksPerGroup, n)
+	b.freedInodesPerGroup = fitSlice(b.freedInodesPerGroup, n)
 	b.usedDirsPerGroup = fitSlice(b.usedDirsPerGroup, n)
 
 	for g := oldGroupCount; g < b.layout.GroupCount; g++ {
 		b.nextBlockPerGroup[g] = b.layout.GetGroupLayout(g).FirstDataBlock
 		b.freedBlocksPerGroup[g] = 0
+		b.freedInodesPerGroup[g] = 0
 		b.usedDirsPerGroup[g] = 0
 	}
 }

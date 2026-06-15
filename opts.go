@@ -103,18 +103,3 @@ func WithMemoryBackend() ImageOption {
 		return nil
 	}
 }
-
-// WithChecksum enables ext4 metadata_csum: every superblock, group descriptor,
-// bitmap, inode, and directory block is written with a valid CRC32C checksum, so
-// e2fsck and a real kernel accept the image with the metadata_csum feature set.
-//
-// The option is off by default; without it the writer produces byte-for-byte the
-// same output it always has. It currently rejects (with a clear error) operations
-// the checksum machinery does not yet cover: extended attributes, files needing
-// an external extent tree, and Resize.
-func WithChecksum() ImageOption {
-	return func(i *Image) error {
-		i.csumEnabled = true
-		return nil
-	}
-}

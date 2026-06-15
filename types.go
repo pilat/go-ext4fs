@@ -71,12 +71,6 @@ const (
 	ftSymlink = 7
 	ftMax     = 8
 
-	// ext4_dir_entry_tail (metadata_csum): a fake "deleted" entry occupying the
-	// last 12 bytes of every directory block. Its file_type byte is the sentinel
-	// 0xDE; the trailing 4 bytes hold the block's det_checksum.
-	dirEntryTailType = 0xDE
-	dirEntryTailSize = 12
-
 	// Inode mode bits
 	s_IXOTH  = 0o0001
 	s_IWOTH  = 0o0002
@@ -100,13 +94,6 @@ const (
 
 	// Inode flags
 	inodeFlagExtents = 0x00080000
-	inodeFlagIndex   = 0x1000 // EXT4_INDEX_FL: directory is hash-tree (htree) indexed
-
-	// Directory hashing (htree)
-	hashVersionHalfMD4         = 1      // s_def_hash_version / dx_root_info.hash_version: half_md4
-	hashVersionHalfMD4Unsigned = 4      // DX_HASH_HALF_MD4_UNSIGNED
-	flagsSignedHash            = 0x0001 // EXT2_FLAGS_SIGNED_HASH (superblock Flags @0x160)
-	flagsUnsignedHash          = 0x0002 // EXT2_FLAGS_UNSIGNED_HASH (superblock Flags @0x160)
 
 	// Feature flags - MINIMAL SET for kernel compatibility
 	// Compatible features (optional)
@@ -124,41 +111,13 @@ const (
 	incompatFlexBG  = 0x0200  // flex_bg
 	incompatEncrypt = 0x10000 // encrypt
 
-	// incompatCsumSeed (metadata_csum_seed): the checksum seed is stored in
-	// s_checksum_seed rather than derived from the UUID. We support reopening such
-	// images by reading the stored seed; the superblock read-modify-write on Save
-	// preserves both the feature bit and the seed field.
-	incompatCsumSeed = 0x2000
-
 	// Mask of incompatible features we support
-	incompatSupported = incompatFileType | incompatExtents | incompatCsumSeed
+	incompatSupported = incompatFileType | incompatExtents
 
 	// Read-only compatible features
-	roCompatSparseSuper  = 0x0001
-	roCompatLargeFile    = 0x0002
-	roCompatHugeFile     = 0x0008
-	roCompatGdtCsum      = 0x0010 // uninit_bg: per-group descriptor checksums we cannot maintain
-	roCompatDirNlink     = 0x0020
-	roCompatExtraIsize   = 0x0040
-	roCompatQuota        = 0x0100 // quota inodes we cannot maintain
-	roCompatBigalloc     = 0x0200 // cluster (not block) bitmaps we would misread
-	roCompatMetadataCsum = 0x0400 // images we cannot safely modify without csum support
-
-	// Mask of read-only-compatible features Open tolerates. sparse_super, large_file,
-	// huge_file, dir_nlink and extra_isize are purely descriptive flags Save never
-	// invalidates. metadata_csum is also tolerated because this library maintains its
-	// checksums on every write (csumEnabled is set from the on-disk feature on Open),
-	// so a reopened checksummed image stays valid. Every other ro_compat bit (gdt_csum,
-	// bigalloc, quota) demands maintenance we don't do and is refused on Open.
-	roCompatSupported = roCompatSparseSuper | roCompatLargeFile | roCompatHugeFile |
-		roCompatDirNlink | roCompatExtraIsize | roCompatMetadataCsum
-
-	// s_checksum_type value selecting CRC32C for metadata_csum.
-	checksumTypeCRC32C = 1
-
-	// Reserved GDT blocks (resize_inode) field in the superblock (offset 0xCE).
-	// A non-zero value shifts every per-group metadata offset, which our geometry
-	// model does not account for, so such images are refused on Open.
+	roCompatSparseSuper = 0x0001
+	roCompatLargeFile   = 0x0002
+	roCompatExtraIsize  = 0x0040
 
 	// Xattr magic
 	xAttrMagic = 0xEA020000
@@ -182,12 +141,6 @@ const (
 	xattrPadBits        = 2
 	xattrBlockHashShift = 16
 )
-
-// defaultHashSeed is the built-in fallback seed used by the half_md4 directory
-// hash when the superblock's s_hash_seed (offset 0xEC) is all-zero. It mirrors
-// e2fsprogs/lib/ext2fs/dirhash.c. Our own images always write a non-zero seed,
-// so this is only reached for foreign images that left s_hash_seed unset.
-var defaultHashSeed = [4]uint32{0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476}
 
 // ============================================================================
 // On-disk structures (must match kernel exactly)

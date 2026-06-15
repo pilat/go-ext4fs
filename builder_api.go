@@ -56,7 +56,7 @@ func (b *builder) createDirectory(parentInode uint32, name string, mode, uid, gi
 		{Inode: inodeNum, Type: ftDir, Name: []byte(".")},
 		{Inode: parentInode, Type: ftDir, Name: []byte("..")},
 	}
-	if err := b.writeDirBlock(dataBlock, inodeNum, inode.Generation, entries); err != nil {
+	if err := b.writeDirBlock(dataBlock, entries); err != nil {
 		return 0, err
 	}
 
@@ -75,9 +75,6 @@ func (b *builder) createDirectory(parentInode uint32, name string, mode, uid, gi
 	// Track directory in correct group
 	group := (inodeNum - 1) / inodesPerGroup
 	b.usedDirsPerGroup[group]++
-
-	// Register for possible htree indexing at finalize (own params).
-	b.reindexDirs[inodeNum] = reindexInfo{}
 
 	if b.debug {
 		fmt.Printf("✓ Created directory: %s (inode %d)\n", name, inodeNum)
@@ -168,12 +165,6 @@ func (b *builder) allocateAndWriteFileContent(inode inode, content []byte) (inod
 		b.setExtent(&inode, 0, blocks[0], 1)
 	} else {
 		if err := b.setExtentMultiple(&inode, blocks); err != nil {
-			// setExtentMultiple can reject (e.g. the metadata_csum guard on an
-			// external extent tree); roll back the just-allocated blocks so a
-			// rejected write leaves no orphaned allocation behind.
-			if freeErr := b.freeBlocks(blocks); freeErr != nil {
-				return inode, nil, fmt.Errorf("%w (allocation rollback failed: %v)", err, freeErr)
-			}
 			return inode, nil, err
 		}
 	}
@@ -200,50 +191,49 @@ func (b *builder) allocateAndWriteFileContent(inode inode, content []byte) (inod
 	return inode, blocks, nil
 }
 
-// inodeBitmapStats scans group g's on-disk inode bitmap and returns the number of
-// used inodes in the group plus itable_unused (inodesPerGroup minus the highest
-// used inode index plus one). The inode bitmap is the authoritative record of
-// inode usage: prepareFilesystem marks the reserved inodes and lost+found,
-// allocateInode and freeInode keep it in sync, and Open reloads it. Counting from
-// the bitmap is correct no matter how inodes are distributed across groups — in
-// particular for foreign images where the kernel's Orlov allocator scatters a
-// subdirectory's inode into a higher group while a lower group still has free
-// inodes above its local high-water, which a single global cursor cannot model.
-func (b *builder) inodeBitmapStats(g uint32) (used, itableUnused uint16, err error) {
-	gl := b.layout.GetGroupLayout(g)
-
-	bitmap := make([]byte, blockSize)
-	if err := b.disk.readAt(bitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
-		return 0, 0, fmt.Errorf("read inode bitmap for group %d: %w", g, err)
-	}
-
-	highestIndex := -1
-
-	var usedCount uint32
-	for i := uint32(0); i < inodesPerGroup; i++ {
-		if bitmap[i/8]&(1<<(i%8)) != 0 {
-			highestIndex = int(i)
-			usedCount++
-		}
-	}
-
-	return uint16(usedCount), uint16(inodesPerGroup - uint32(highestIndex+1)), nil
-}
-
 // calculateGroupStats calculates free blocks, free inodes, and itable unused for a group.
-func (b *builder) calculateGroupStats(g uint32) (freeBlocks, freeInodes, itableUnused uint16, err error) {
+func (b *builder) calculateGroupStats(g uint32) (uint16, uint16, uint16) {
 	gl := b.layout.GetGroupLayout(g)
 
 	usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
-	freeBlocks = uint16(gl.BlocksInGroup - usedBlocks)
+	freeBlocks := uint16(gl.BlocksInGroup - usedBlocks)
 
-	usedInodes, itableUnused, err := b.inodeBitmapStats(g)
-	if err != nil {
-		return 0, 0, 0, err
+	groupStartInode := g*inodesPerGroup + 1
+	groupEndInode := groupStartInode + inodesPerGroup
+
+	var (
+		usedInodes       uint16
+		highestUsedInode uint32
+	)
+
+	if b.nextInode > groupStartInode {
+		if b.nextInode >= groupEndInode {
+			usedInodes = uint16(inodesPerGroup)
+			highestUsedInode = inodesPerGroup
+		} else {
+			usedInodes = uint16(b.nextInode - groupStartInode)
+			highestUsedInode = b.nextInode - groupStartInode
+		}
 	}
-	freeInodes = uint16(inodesPerGroup) - usedInodes
 
-	return freeBlocks, freeInodes, itableUnused, nil
+	// For group 0, account for reserved inodes
+	if g == 0 {
+		if highestUsedInode < firstNonResInode-1 {
+			highestUsedInode = firstNonResInode - 1
+		}
+
+		if usedInodes < uint16(firstNonResInode-1) {
+			usedInodes = uint16(firstNonResInode - 1)
+		}
+	}
+
+	// Account for freed inodes
+	usedInodes -= uint16(b.freedInodesPerGroup[g])
+
+	freeInodes := uint16(inodesPerGroup) - usedInodes
+	itableUnused := uint16(inodesPerGroup - highestUsedInode)
+
+	return freeBlocks, freeInodes, itableUnused
 }
 
 // updateGroupDescriptor updates the group descriptor for the given group.
@@ -261,15 +251,6 @@ func (b *builder) updateGroupDescriptor(g uint32, freeBlocks, freeInodes, usedDi
 	binary.LittleEndian.PutUint16(gdBuf[16:18], usedDirs)
 	binary.LittleEndian.PutUint16(gdBuf[18:20], 0) // Flags
 	binary.LittleEndian.PutUint16(gdBuf[28:30], itableUnused)
-
-	// metadata_csum: fill the bitmap checksums (inside the descriptor's covered
-	// range) BEFORE the descriptor's own bg_checksum. Done here so the same
-	// checksummed buffer is mirrored to every backup below.
-	if b.csumEnabled {
-		if err := b.setGroupDescChecksums(g, gdBuf); err != nil {
-			return err
-		}
-	}
 
 	if err := b.disk.writeAt(gdBuf, int64(gdOffset)); err != nil {
 		return fmt.Errorf("failed to write group descriptor for group %d: %w", g, err)
@@ -290,76 +271,6 @@ func (b *builder) updateGroupDescriptor(g uint32, freeBlocks, freeInodes, usedDi
 	return nil
 }
 
-// setGroupDescChecksums fills the metadata_csum fields of a group descriptor
-// buffer in coverage order: the block-bitmap checksum (0x18) and inode-bitmap
-// checksum (0x1A) first, since both live inside the descriptor's covered range,
-// then bg_checksum (0x1E) over the whole descriptor. The bitmaps are read back from
-// disk (the allocator writes them one byte at a time, so there is no in-memory copy).
-func (b *builder) setGroupDescChecksums(g uint32, gdBuf []byte) error {
-	gl := b.layout.GetGroupLayout(g)
-
-	blockBitmap := make([]byte, blockSize)
-	if err := b.disk.readAt(blockBitmap, int64(b.layout.BlockOffset(gl.BlockBitmapBlock))); err != nil {
-		return fmt.Errorf("failed to read block bitmap for group %d checksum: %w", g, err)
-	}
-	binary.LittleEndian.PutUint16(gdBuf[0x18:], bitmapCsum(b.csumSeed, blockBitmap))
-
-	inodeBitmap := make([]byte, (inodesPerGroup+7)/8)
-	if err := b.disk.readAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
-		return fmt.Errorf("failed to read inode bitmap for group %d checksum: %w", g, err)
-	}
-	binary.LittleEndian.PutUint16(gdBuf[0x1A:], bitmapCsum(b.csumSeed, inodeBitmap))
-
-	binary.LittleEndian.PutUint16(gdBuf[0x1E:], groupDescCsum(b.csumSeed, g, gdBuf))
-
-	return nil
-}
-
-// applyDirIndexFlags records the dir_index feature and the directory-hash
-// signedness in a superblock buffer when an own-origin directory was htree
-// indexed (decision 8). It ORs compatDirIndex into s_feature_compat (0x5C) and
-// writes the signedness in s_flags (0x160), clearing both signedness bits first
-// so they are never both set. It is a no-op otherwise, so the default (no indexed
-// directory) path leaves the superblock byte-for-byte unchanged. Applied to the
-// primary AND every backup so e2fsck sees no mismatch. It also runs when an own
-// directory is indexed on an OPENED foreign image (creating a new directory there
-// sets dirIndexUsed), reconciling s_flags to b.signedHash — which Open adopted
-// from this same superblock, so the foreign value is preserved.
-func (b *builder) applyDirIndexFlags(sbBuf []byte) {
-	if !b.dirIndexUsed {
-		return
-	}
-
-	feat := binary.LittleEndian.Uint32(sbBuf[0x5C:0x60]) | compatDirIndex
-	binary.LittleEndian.PutUint32(sbBuf[0x5C:0x60], feat)
-
-	flags := binary.LittleEndian.Uint32(sbBuf[0x160:0x164])
-	flags &^= flagsSignedHash | flagsUnsignedHash
-	if b.signedHash {
-		flags |= flagsSignedHash
-	} else {
-		flags |= flagsUnsignedHash
-	}
-	binary.LittleEndian.PutUint32(sbBuf[0x160:0x164], flags)
-}
-
-// patchSuperblockCounts writes the free-block and free-inode counts into a
-// superblock buffer and applies the dir_index/signedness flags. Shared by the
-// primary and every backup superblock update so the patch sequence lives once.
-func (b *builder) patchSuperblockCounts(sbBuf []byte, freeBlocks, freeInodes uint32) {
-	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], freeBlocks)
-	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], freeInodes)
-	b.applyDirIndexFlags(sbBuf)
-
-	// metadata_csum: the SB checksum is computed LAST, over the final image (the
-	// free counts and the dir_index/signedness flags above are inside its covered
-	// [0:0x3FC] range). Recomputed per copy, so each backup's own s_block_group_nr
-	// is covered.
-	if b.csumEnabled {
-		binary.LittleEndian.PutUint32(sbBuf[0x3FC:], superblockCsum(sbBuf))
-	}
-}
-
 // updateSuperblocks updates the primary and backup superblocks with total free blocks and inodes.
 func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) error {
 	// Update primary superblock
@@ -370,7 +281,8 @@ func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) err
 		return fmt.Errorf("failed to read primary superblock: %w", err)
 	}
 
-	b.patchSuperblockCounts(sbBuf, totalFreeBlocks, totalFreeInodes)
+	binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
+	binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
 
 	if err := b.disk.writeAt(sbBuf, int64(sbOffset)); err != nil {
 		return fmt.Errorf("failed to write primary superblock: %w", err)
@@ -386,7 +298,8 @@ func (b *builder) updateSuperblocks(totalFreeBlocks, totalFreeInodes uint32) err
 				return fmt.Errorf("failed to read backup superblock for group %d: %w", g, err)
 			}
 
-			b.patchSuperblockCounts(sbBuf, totalFreeBlocks, totalFreeInodes)
+			binary.LittleEndian.PutUint32(sbBuf[0x0C:0x10], totalFreeBlocks)
+			binary.LittleEndian.PutUint32(sbBuf[0x10:0x14], totalFreeInodes)
 
 			if err := b.disk.writeAt(sbBuf, int64(backupSbOffset)); err != nil {
 				return fmt.Errorf("failed to write backup superblock for group %d: %w", g, err)
@@ -704,10 +617,6 @@ func (b *builder) deleteDirectory(parentInode uint32, name string) error {
 // beyond standard file attributes. Names use namespace prefixes like "user.",
 // "trusted.", "security.", or "system.". If the xattr already exists, its value is updated.
 func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
-	if b.csumEnabled {
-		return csumUnsupported("xattrs")
-	}
-
 	if len(name) == 0 {
 		return fmt.Errorf("xattr name cannot be empty")
 	}
@@ -752,7 +661,25 @@ func (b *builder) setXattr(inodeNum uint32, name string, value []byte) error {
 		inode.BlocksLo += blockSize / 512
 	}
 
-	entries = upsertXattr(entries, nameIndex, shortName, value)
+	// Update existing or add new entry
+	found := false
+
+	for i, e := range entries {
+		if e.NameIndex == nameIndex && e.Name == shortName {
+			entries[i].Value = value
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		entries = append(entries, xAttrEntry{
+			NameIndex: nameIndex,
+			Name:      shortName,
+			Value:     value,
+		})
+	}
 
 	if err := b.writeXattrBlock(xattrBlock, entries); err != nil {
 		return err
@@ -801,10 +728,6 @@ func (b *builder) listXattrs(inodeNum uint32) ([]string, error) {
 // If the attribute doesn't exist, no error is returned (idempotent operation).
 // The xattr block may be deallocated if it becomes empty after removal.
 func (b *builder) removeXattr(inodeNum uint32, name string) error {
-	if b.csumEnabled {
-		return csumUnsupported("xattrs")
-	}
-
 	nameIndex, shortName, err := parseXattrName(name)
 	if err != nil {
 		return err
@@ -866,24 +789,15 @@ func (b *builder) removeXattr(inodeNum uint32, name string) error {
 // updating group descriptors with accurate counts, and ensuring the superblock
 // reflects the current filesystem state. Must be called after all file operations.
 func (b *builder) finalizeMetadata() error {
-	// Calculate per-group statistics, update descriptors, and total free inodes.
-	// Free inodes come straight from each group's bitmap (calculateGroupStats), so
-	// the total is the sum of the per-group counts rather than a global-cursor
-	// formula that cannot represent inodes scattered across groups.
-	var totalFreeInodes uint32
-
+	// Calculate per-group statistics and update descriptors
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		freeBlocks, freeInodes, itableUnused, err := b.calculateGroupStats(g)
-		if err != nil {
-			return err
-		}
+		freeBlocks, freeInodes, itableUnused := b.calculateGroupStats(g)
 		if err := b.updateGroupDescriptor(g, freeBlocks, freeInodes, b.usedDirsPerGroup[g], itableUnused); err != nil {
 			return err
 		}
-		totalFreeInodes += uint32(freeInodes)
 	}
 
-	// Calculate total free blocks for superblock
+	// Calculate totals for superblock
 	var totalFreeBlocks uint32
 
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
@@ -891,6 +805,14 @@ func (b *builder) finalizeMetadata() error {
 		usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
 		totalFreeBlocks += gl.BlocksInGroup - usedBlocks
 	}
+
+	// Calculate total freed inodes across all groups
+	var totalFreedInodes uint32
+	for g := uint32(0); g < b.layout.GroupCount; g++ {
+		totalFreedInodes += b.freedInodesPerGroup[g]
+	}
+
+	totalFreeInodes := b.layout.TotalInodes() - (b.nextInode - 1) + totalFreedInodes
 
 	if err := b.updateSuperblocks(totalFreeBlocks, totalFreeInodes); err != nil {
 		return err
