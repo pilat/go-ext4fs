@@ -2551,7 +2551,7 @@ func testOpenInvalidImage(t *testing.T) {
 		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported filesystem features")
-		assert.Contains(t, err.Error(), "only images created by this library are supported")
+		assert.Contains(t, err.Error(), "this library can modify only a subset of ext4 images")
 	}
 }
 

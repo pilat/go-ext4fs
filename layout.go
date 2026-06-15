@@ -222,7 +222,7 @@ func checkIncompatFeatures(featureIncompat uint32) error {
 	if len(features) == 0 {
 		features = append(features, fmt.Sprintf("0x%x", unsupported))
 	}
-	return fmt.Errorf("unsupported filesystem features: %v (only images created by this library are supported)", features)
+	return fmt.Errorf("unsupported filesystem features: %v (this library can modify only a subset of ext4 images)", features)
 }
 
 // checkROCompatFeatures returns an error naming any read-only-compatible features
@@ -252,14 +252,15 @@ func checkROCompatFeatures(featureROCompat uint32) error {
 	if len(features) == 0 {
 		features = append(features, fmt.Sprintf("0x%x", unsupported))
 	}
-	return fmt.Errorf("unsupported read-only-compatible features: %v (only images created by this library are supported)", features)
+	return fmt.Errorf("unsupported read-only-compatible features: %v (this library can modify only a subset of ext4 images)", features)
 }
 
 // loadLayoutFromDisk reads the superblock from an existing ext4 filesystem
 // and reconstructs the Layout struct from the on-disk metadata.
 // It validates the ext4 magic number, block size (4096), inode size (256),
 // and rejects filesystems with unsupported features (journaling, 64-bit, flex_bg, etc.).
-// Only images created by this library can be opened for modification.
+// Own images always pass; a foreign image opens only if every feature it carries is
+// one this library can preserve across a Save.
 func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 	// Read superblock (1024 bytes at offset 1024)
 	sbData := make([]byte, 1024)
@@ -335,6 +336,11 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 	}
 	defHashVersion := sbData[0xFC]
 	sbFlags := binary.LittleEndian.Uint32(sbData[0x160:0x164])
+	// ext4 encodes the unsigned half_md4 variant two ways: the s_flags
+	// UNSIGNED_HASH bit, or s_def_hash_version itself being an *_UNSIGNED version.
+	// Honour both, else a version-encoded image is rehashed as signed on the next
+	// htree rebuild and the index no longer resolves by name.
+	unsignedHash := sbFlags&flagsUnsignedHash != 0 || defHashVersion == hashVersionHalfMD4Unsigned
 
 	// Calculate partition size from block count
 	partitionSize := uint64(blocksCountLo) * blockSize
@@ -353,7 +359,7 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		CreatedAt:        mkfsTime,
 		HashSeed:         hashSeed,
 		DefHashVersion:   defHashVersion,
-		UnsignedHash:     sbFlags&flagsUnsignedHash != 0,
+		UnsignedHash:     unsignedHash,
 	}
 
 	return layout, nil

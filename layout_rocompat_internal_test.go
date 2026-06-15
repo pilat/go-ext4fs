@@ -14,6 +14,10 @@ import (
 // superblock lives at superblockOffset (1024) and the field sits at 0x64 within it.
 const roCompatFieldOffset = superblockOffset + 0x64
 
+// defHashVersionOffset is the byte offset of s_def_hash_version (0xFC within the
+// primary superblock).
+const defHashVersionOffset = superblockOffset + 0xFC
+
 // buildOwnImage creates a minimal image with this library and returns its path.
 // Our own images carry no metadata_csum, so byte-patching the superblock afterward
 // needs no checksum fix-up to remain openable.
@@ -76,4 +80,25 @@ func TestOpenAcceptsSafeROCompat(t *testing.T) {
 	img, err := Open(WithExistingImagePath(path))
 	require.NoError(t, err)
 	require.NoError(t, img.Close())
+}
+
+// TestOpenDetectsUnsignedHashFromVersion: ext4 marks the unsigned half_md4 variant
+// either via the s_flags UNSIGNED bit OR via s_def_hash_version == *_UNSIGNED. An
+// image using the version encoding (no s_flags bit, as our own images leave it)
+// must still be treated as unsigned, otherwise the next htree rebuild rehashes it
+// as signed and the index stops resolving by name.
+func TestOpenDetectsUnsignedHashFromVersion(t *testing.T) {
+	path := buildOwnImage(t)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{hashVersionHalfMD4Unsigned}, defHashVersionOffset)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	img, err := Open(WithExistingImagePath(path))
+	require.NoError(t, err)
+	defer func() { _ = img.Close() }()
+	assert.False(t, img.builder.signedHash,
+		"version-encoded unsigned hash (s_def_hash_version==4) must yield signedHash=false")
 }

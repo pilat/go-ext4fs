@@ -160,7 +160,7 @@ Optimized for boot disks, rootfs images and fixtures — not a general-purpose m
 | Journaling | None for image creation; images mount in writeback mode |
 | 64-bit block addresses | Maximum filesystem size ~16 TB |
 | Extent tree depth > 1 | Up to 1,360 extents per file — contiguous files up to ~170 GiB |
-| HTree directory indexing | Depth-1 supported; directories beyond ~508 leaf blocks stay linear |
+| HTree directory indexing | Indexed up to ~100k entries per directory (depth-1); larger directories stay linear — valid, but name lookup is unindexed |
 | Inline data | Small files occupy one full block |
 | Encryption, quotas | Not implemented |
 | Resize beyond 16 GiB | Larger images can be created, not resized |
