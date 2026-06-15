@@ -191,49 +191,49 @@ func (b *builder) allocateAndWriteFileContent(inode inode, content []byte) (inod
 	return inode, blocks, nil
 }
 
-// calculateGroupStats calculates free blocks, free inodes, and itable unused for a group.
-func (b *builder) calculateGroupStats(g uint32) (uint16, uint16, uint16) {
+// inodeBitmapStats scans group g's on-disk inode bitmap and returns the number of
+// used inodes plus the count of unused inodes at the tail of the table
+// (itable_unused). The bitmap is the source of truth — setInodeBit/clearInodeBit
+// write it through on every alloc/free — so this stays correct across reopen
+// regardless of which inodes were freed below the allocation high-water mark.
+func (b *builder) inodeBitmapStats(g uint32) (used, itableUnused uint16, err error) {
+	gl := b.layout.GetGroupLayout(g)
+
+	bitmap := make([]byte, blockSize)
+	if err := b.disk.readAt(bitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
+		return 0, 0, fmt.Errorf("read inode bitmap for group %d: %w", g, err)
+	}
+
+	highestIndex := -1
+
+	var usedCount uint32
+	for i := uint32(0); i < inodesPerGroup; i++ {
+		if bitmap[i/8]&(1<<(i%8)) != 0 {
+			highestIndex = int(i)
+			usedCount++
+		}
+	}
+
+	return uint16(usedCount), uint16(inodesPerGroup - uint32(highestIndex+1)), nil
+}
+
+// calculateGroupStats returns free blocks, free inodes, and itable_unused for a
+// group. Free inodes come straight from the bitmap (inodeBitmapStats); free blocks
+// from the per-group cursor minus blocks freed below the high-water mark (seeded
+// from the bitmap on reopen by loadBlockBitmap).
+func (b *builder) calculateGroupStats(g uint32) (freeBlocks, freeInodes, itableUnused uint16, err error) {
 	gl := b.layout.GetGroupLayout(g)
 
 	usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
-	freeBlocks := uint16(gl.BlocksInGroup - usedBlocks)
+	freeBlocks = uint16(gl.BlocksInGroup - usedBlocks)
 
-	groupStartInode := g*inodesPerGroup + 1
-	groupEndInode := groupStartInode + inodesPerGroup
-
-	var (
-		usedInodes       uint16
-		highestUsedInode uint32
-	)
-
-	if b.nextInode > groupStartInode {
-		if b.nextInode >= groupEndInode {
-			usedInodes = uint16(inodesPerGroup)
-			highestUsedInode = inodesPerGroup
-		} else {
-			usedInodes = uint16(b.nextInode - groupStartInode)
-			highestUsedInode = b.nextInode - groupStartInode
-		}
+	usedInodes, itableUnused, err := b.inodeBitmapStats(g)
+	if err != nil {
+		return 0, 0, 0, err
 	}
+	freeInodes = uint16(inodesPerGroup) - usedInodes
 
-	// For group 0, account for reserved inodes
-	if g == 0 {
-		if highestUsedInode < firstNonResInode-1 {
-			highestUsedInode = firstNonResInode - 1
-		}
-
-		if usedInodes < uint16(firstNonResInode-1) {
-			usedInodes = uint16(firstNonResInode - 1)
-		}
-	}
-
-	// Account for freed inodes
-	usedInodes -= uint16(b.freedInodesPerGroup[g])
-
-	freeInodes := uint16(inodesPerGroup) - usedInodes
-	itableUnused := uint16(inodesPerGroup - highestUsedInode)
-
-	return freeBlocks, freeInodes, itableUnused
+	return freeBlocks, freeInodes, itableUnused, nil
 }
 
 // updateGroupDescriptor updates the group descriptor for the given group.
@@ -789,15 +789,24 @@ func (b *builder) removeXattr(inodeNum uint32, name string) error {
 // updating group descriptors with accurate counts, and ensuring the superblock
 // reflects the current filesystem state. Must be called after all file operations.
 func (b *builder) finalizeMetadata() error {
-	// Calculate per-group statistics and update descriptors
+	// Per-group free inodes come straight from each group's bitmap
+	// (calculateGroupStats), so the superblock total is the sum of the per-group
+	// counts rather than a global-cursor formula that cannot see inodes freed below
+	// the allocation high-water mark.
+	var totalFreeInodes uint32
+
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		freeBlocks, freeInodes, itableUnused := b.calculateGroupStats(g)
+		freeBlocks, freeInodes, itableUnused, err := b.calculateGroupStats(g)
+		if err != nil {
+			return err
+		}
 		if err := b.updateGroupDescriptor(g, freeBlocks, freeInodes, b.usedDirsPerGroup[g], itableUnused); err != nil {
 			return err
 		}
+		totalFreeInodes += uint32(freeInodes)
 	}
 
-	// Calculate totals for superblock
+	// Calculate total free blocks for superblock
 	var totalFreeBlocks uint32
 
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
@@ -805,14 +814,6 @@ func (b *builder) finalizeMetadata() error {
 		usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
 		totalFreeBlocks += gl.BlocksInGroup - usedBlocks
 	}
-
-	// Calculate total freed inodes across all groups
-	var totalFreedInodes uint32
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		totalFreedInodes += b.freedInodesPerGroup[g]
-	}
-
-	totalFreeInodes := b.layout.TotalInodes() - (b.nextInode - 1) + totalFreedInodes
 
 	if err := b.updateSuperblocks(totalFreeBlocks, totalFreeInodes); err != nil {
 		return err
