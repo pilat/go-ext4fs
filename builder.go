@@ -20,16 +20,38 @@ type builder struct {
 	label        string // Volume label written to the superblock (New path only)
 	skipZeroInit bool   // Skip zeroing freshly-truncated inode tables (already zero)
 
+	// Directory hashing (htree) parameters and state. The New path derives
+	// hashSeed/signedHash; Open reads them from the foreign superblock. dirIndexUsed
+	// records that an OWN-origin directory was indexed, which gates the dir_index
+	// feature bit and signedness flag in updateSuperblocks (decision 8); it is never
+	// set from the foreign reindex path.
+	hashSeed       [4]uint32
+	defHashVersion uint8
+	signedHash     bool
+	dirIndexUsed   bool
+
+	// reindexDirs is the set of directories considered for htree indexing at
+	// finalize, keyed by inode (auto-deduped). Own directories are registered by
+	// createDirectory; foreign htree directories register on their first mutation.
+	reindexDirs map[uint32]reindexInfo
+
 	// Allocation state - per group
 	nextBlockPerGroup   []uint32  // Next free block in each group
 	freedBlocksPerGroup []uint32  // Blocks freed per group (for overwrites)
 	freeRuns            []freeRun // Free block runs sorted by count (ascending) for best-fit
 	nextInode           uint32    // Next free inode (global)
-	freedInodesPerGroup []uint32  // Inodes freed per group (for deletes)
 	freeInodeList       []uint32  // List of freed inodes available for reuse
 
 	// Tracking
 	usedDirsPerGroup []uint16 // Directory count per group
+}
+
+// reindexInfo records how a directory should be re-indexed at finalize. foreign
+// distinguishes a directory that originated as a foreign htree (which keeps the
+// image's hash version and must never set dirIndexUsed) from an own directory.
+type reindexInfo struct {
+	foreign     bool
+	hashVersion uint8 // captured foreign dx_root hash version; unused for own dirs
 }
 
 // newBuilder creates a new Builder instance with initialized allocation state.
@@ -45,9 +67,11 @@ func newBuilder(disk diskBackend, layout *Layout) *builder {
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeRuns:            nil,
 		nextInode:           firstNonResInode,
-		freedInodesPerGroup: make([]uint32, layout.GroupCount),
 		freeInodeList:       make([]uint32, 0),
 		usedDirsPerGroup:    make([]uint16, layout.GroupCount),
+		defHashVersion:      hashVersionHalfMD4,
+		signedHash:          true, // own images hash signed (decision 7); Open overrides
+		reindexDirs:         make(map[uint32]reindexInfo),
 	}
 
 	// Initialize next free block for each group
@@ -118,8 +142,12 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 	}
 	b.nextBlockPerGroup[g] = gl.GroupStart + highestUsed + 1
 
-	// Find free block runs (holes)
-	var runStart, runCount uint32
+	// Find free block runs (holes) below the high-water mark. They are reusable
+	// (added to freeRuns) and also recorded as freed so the free-block count is
+	// correct on a foreign image whose deleted files left holes. For our own
+	// images (sequential allocation, no holes) this is zero, leaving the count
+	// unchanged.
+	var runStart, runCount, holes uint32
 	for i := dataStart; i <= highestUsed; i++ {
 		isFree := blockBitmap[i/8]&(1<<(i%8)) == 0
 		if isFree {
@@ -129,33 +157,39 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 			runCount++
 		} else if runCount > 0 {
 			b.addFreeRun(freeRun{start: runStart, count: runCount})
+			holes += runCount
 			runCount = 0
 		}
 	}
 	if runCount > 0 {
 		b.addFreeRun(freeRun{start: runStart, count: runCount})
+		holes += runCount
 	}
+	b.freedBlocksPerGroup[g] = holes
 
 	return nil
 }
 
-// loadInodeBitmap scans a group's inode bitmap and returns the highest allocated inode.
-func (b *builder) loadInodeBitmap(g uint32, gl GroupLayout) (uint32, error) {
+// loadInodeBitmap scans a group's inode bitmap and returns the highest allocated
+// inode (0 if the group has none), used to seed the global nextInode cursor.
+// Per-group inode usage is recomputed directly from the bitmap at finalize
+// (calculateGroupStats), so no free-inode "holes" accounting is needed here.
+func (b *builder) loadInodeBitmap(g uint32, gl GroupLayout) (highest uint32, err error) {
 	inodeBitmap := make([]byte, blockSize)
 	if err := b.disk.readAt(inodeBitmap, int64(b.layout.BlockOffset(gl.InodeBitmapBlock))); err != nil {
 		return 0, fmt.Errorf("read inode bitmap for group %d: %w", g, err)
 	}
 
-	var highest uint32
+	highestIndex := -1
 	for i := uint32(0); i < b.layout.InodesPerGroup; i++ {
 		if inodeBitmap[i/8]&(1<<(i%8)) != 0 {
-			inodeNum := g*b.layout.InodesPerGroup + i + 1
-			if inodeNum > highest {
-				highest = inodeNum
-			}
+			highestIndex = int(i)
 		}
 	}
-	return highest, nil
+	if highestIndex < 0 {
+		return 0, nil
+	}
+	return g*b.layout.InodesPerGroup + uint32(highestIndex) + 1, nil
 }
 
 // loadGroupDirCount reads the directory count from a group descriptor.

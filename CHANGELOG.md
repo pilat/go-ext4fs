@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-14
+
+### Added
+
+- HTree (`dir_index`) directory support. Directories that outgrow a single block
+  are now emitted as valid depth-1 hash-tree indexes, so files in large
+  directories open by name on a mounted kernel instead of falling back to a
+  linear scan. The directory hash is a byte-exact half_md4 (signed and unsigned),
+  validated against `e2fsprogs`. The `dir_index` feature and hash-signedness flag
+  are recorded only when a directory is actually indexed, so images without large
+  directories are byte-for-byte unchanged.
+- Maintenance of htree directories in foreign images opened with `Open`. Adding
+  to an indexed directory now flattens and rebuilds its index with the image's
+  own hash seed and signedness instead of overwriting it; deletes are left as the
+  kernel does, untouched.
+
+### Fixed
+
+- Adding an entry to a hash-indexed directory previously overwrote its dx_root
+  index on the first insert — a silent corruption reachable once `Open` accepted
+  foreign images. Such inserts now flatten the directory and re-index it at save.
+- The free-inode count is now correct after reopening an image whose directory
+  entries were deleted by a previous session or the kernel (inodes freed below
+  the allocation high-water mark were previously miscounted as used).
+- `Open` now refuses images carrying `metadata_csum` or reserved GDT blocks
+  (`resize_inode`) instead of silently mis-reading and corrupting them on save.
+
 ## [1.0.1] - 2026-06-10
 
 ### Added
@@ -50,5 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bracket, reproducible images via `WithCreatedAt`, and `Open` support for
   images created by this library.
 
+[1.1.0]: https://github.com/pilat/go-ext4fs/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/pilat/go-ext4fs/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/pilat/go-ext4fs/releases/tag/v1.0.0

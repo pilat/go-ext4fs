@@ -1099,6 +1099,13 @@ func testManySmallFiles(t *testing.T) {
 	assert.Contains(t, output, "last exists")
 	assert.Contains(t, output, "Content 0")
 	assert.Contains(t, output, "Content 499")
+
+	// 500 entries overflow a single directory block, so the directory must have
+	// been emitted as a depth-1 htree and the dir_index feature recorded. The
+	// open-by-name checks above are the hash oracle that proves the index is valid.
+	flags := env.inodeFlagsByPath(t, "/extent_test")
+	assert.NotZero(t, flags&ext4fs.InodeFlagIndexForTest, "directory should be htree-indexed (EXT4_INDEX_FL), flags=0x%x", flags)
+	assert.Contains(t, env.dumpe2fsHeader(), "dir_index", "dir_index feature must be set once a directory is indexed")
 }
 
 // testFreedBlockRunReuse overwrites a multi-block file and creates an
@@ -2544,7 +2551,7 @@ func testOpenInvalidImage(t *testing.T) {
 		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported filesystem features")
-		assert.Contains(t, err.Error(), "only images created by this library are supported")
+		assert.Contains(t, err.Error(), "this library can modify only a subset of ext4 images")
 	}
 }
 
