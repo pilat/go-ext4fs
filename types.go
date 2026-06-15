@@ -124,8 +124,22 @@ const (
 	// Read-only compatible features
 	roCompatSparseSuper  = 0x0001
 	roCompatLargeFile    = 0x0002
+	roCompatHugeFile     = 0x0008
+	roCompatGdtCsum      = 0x0010 // uninit_bg: per-group descriptor checksums we cannot maintain
+	roCompatDirNlink     = 0x0020
 	roCompatExtraIsize   = 0x0040
+	roCompatQuota        = 0x0100 // quota inodes we cannot maintain
+	roCompatBigalloc     = 0x0200 // cluster (not block) bitmaps we would misread
 	roCompatMetadataCsum = 0x0400 // images we cannot safely modify without csum support
+
+	// Mask of read-only-compatible features Open tolerates. These are purely
+	// descriptive flags that Save never invalidates: they need no per-block
+	// maintenance, so preserving them across a free-count rewrite is safe. Every
+	// other ro_compat bit (gdt_csum, bigalloc, quota, metadata_csum) demands
+	// maintenance we don't do and is refused on Open. Both our own images
+	// (sparse_super|large_file|extra_isize) and real mke2fs images
+	// (additionally huge_file|dir_nlink) are subsets of this mask.
+	roCompatSupported = roCompatSparseSuper | roCompatLargeFile | roCompatHugeFile | roCompatDirNlink | roCompatExtraIsize
 
 	// Reserved GDT blocks (resize_inode) field in the superblock (offset 0xCE).
 	// A non-zero value shifts every per-group metadata offset, which our geometry

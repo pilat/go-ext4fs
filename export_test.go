@@ -9,14 +9,19 @@ import "encoding/binary"
 // EmitHtreeForTest reads dirInode's current entries and rebuilds it as a depth-1
 // htree using the builder's own hash params (as the own-images finalize path
 // will), marking dirIndexUsed so Save records the dir_index feature and signedness
-// flag. Returns the typed sentinel unchanged when the set does not fit depth-1.
+// flag. Returns the typed sentinel (errHtreeNotIndexable) unchanged when the
+// directory cannot be indexed depth-1.
 func (e *Image) EmitHtreeForTest(dirInode uint32) error {
 	b := e.builder
+	inode, err := b.readInode(dirInode)
+	if err != nil {
+		return err
+	}
 	entries, parent, err := b.readAllEntries(dirInode)
 	if err != nil {
 		return err
 	}
-	if err := b.emitHtree(dirInode, parent, entries, b.hashSeed, b.defHashVersion, b.signedHash); err != nil {
+	if err := b.emitHtree(dirInode, inode, parent, entries, b.defHashVersion); err != nil {
 		return err
 	}
 	b.dirIndexUsed = true

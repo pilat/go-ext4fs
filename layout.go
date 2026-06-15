@@ -225,6 +225,36 @@ func checkIncompatFeatures(featureIncompat uint32) error {
 	return fmt.Errorf("unsupported filesystem features: %v (only images created by this library are supported)", features)
 }
 
+// checkROCompatFeatures returns an error naming any read-only-compatible features
+// the image carries that this library cannot maintain across a Save. Save rewrites
+// per-group free counts but does no per-block maintenance, so any ro_compat bit
+// outside roCompatSupported (group-descriptor checksums, cluster bitmaps, quota,
+// metadata_csum) would be silently invalidated on the next Save and is refused here.
+func checkROCompatFeatures(featureROCompat uint32) error {
+	unsupported := featureROCompat &^ roCompatSupported
+	if unsupported == 0 {
+		return nil
+	}
+
+	var features []string
+	if unsupported&roCompatGdtCsum != 0 {
+		features = append(features, "uninit_bg/gdt_csum")
+	}
+	if unsupported&roCompatQuota != 0 {
+		features = append(features, "quota")
+	}
+	if unsupported&roCompatBigalloc != 0 {
+		features = append(features, "bigalloc")
+	}
+	if unsupported&roCompatMetadataCsum != 0 {
+		features = append(features, "metadata_csum")
+	}
+	if len(features) == 0 {
+		features = append(features, fmt.Sprintf("0x%x", unsupported))
+	}
+	return fmt.Errorf("unsupported read-only-compatible features: %v (only images created by this library are supported)", features)
+}
+
 // loadLayoutFromDisk reads the superblock from an existing ext4 filesystem
 // and reconstructs the Layout struct from the on-disk metadata.
 // It validates the ext4 magic number, block size (4096), inode size (256),
@@ -279,12 +309,13 @@ func loadLayoutFromDisk(backend diskBackend) (*Layout, error) {
 		return nil, fmt.Errorf("unsupported inodes per group: %d (expected %d)", inodesPerGroupSB, inodesPerGroup)
 	}
 
-	// Refuse images we would silently corrupt by modifying. metadata_csum requires
-	// rewriting checksums on every metadata block we touch (not yet supported off
-	// this branch); a non-zero reserved-GDT count (resize_inode) shifts every
-	// per-group metadata offset, which our geometry model does not account for.
-	if featureROCompat&roCompatMetadataCsum != 0 {
-		return nil, fmt.Errorf("metadata_csum filesystems are not supported for modification")
+	// Refuse images we would silently corrupt by modifying. Any ro_compat feature
+	// outside the allowlist (gdt_csum, bigalloc, quota, metadata_csum, ...) needs
+	// per-block maintenance our Save does not perform; a non-zero reserved-GDT count
+	// (resize_inode) shifts every per-group metadata offset our geometry model does
+	// not account for.
+	if err := checkROCompatFeatures(featureROCompat); err != nil {
+		return nil, err
 	}
 	// GetGroupLayout hardcodes sparse-super backup placement; without sparse_super
 	// every group carries superblock+GDT backups, shifting the per-group metadata

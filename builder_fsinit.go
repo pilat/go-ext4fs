@@ -305,6 +305,11 @@ func (b *builder) createRootDirectory() error {
 	// Root inode is always in group 0
 	b.usedDirsPerGroup[0]++
 
+	// Register for possible htree indexing at finalize (own params), same as any
+	// other directory: a root that outgrows one block is indexed, a small one
+	// stays linear (emitHtreeDirs only indexes dirs exceeding one leaf block).
+	b.reindexDirs[RootInode] = reindexInfo{}
+
 	if b.debug {
 		fmt.Printf("✓ Root directory created\n")
 	}

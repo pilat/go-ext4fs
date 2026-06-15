@@ -124,13 +124,21 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 	lastOffset := 0
 
 	for offset < blockSize {
-		recLen := binary.LittleEndian.Uint16(block[offset+4:])
+		// Validate the record before walking past it, matching walkDirentBlock;
+		// the in-place mutation below cannot delegate to it.
+		if offset+8 > blockSize {
+			return false, fmt.Errorf("directory block %d: truncated dirent at offset %d", blockNum, offset)
+		}
+		recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
 		if recLen == 0 {
 			break
 		}
+		if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
+			return false, fmt.Errorf("directory block %d: invalid rec_len %d at offset %d", blockNum, recLen, offset)
+		}
 
 		lastOffset = offset
-		offset += int(recLen)
+		offset += recLen
 	}
 
 	lastActualSize := dirRecLen(int(block[lastOffset+6]))
@@ -185,12 +193,23 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 		prevOffset := -1
 
 		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
+			// Validate the record before slicing or mutating, matching
+			// walkDirentBlock; the mutation below cannot delegate to it.
+			if offset+8 > blockSize {
+				return fmt.Errorf("directory inode %d, block %d: truncated dirent at offset %d", dirInode, blockNum, offset)
+			}
+			recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
 			if recLen == 0 {
 				break
 			}
+			if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
+				return fmt.Errorf("directory inode %d, block %d: invalid rec_len %d at offset %d", dirInode, blockNum, recLen, offset)
+			}
 
 			nameLen := int(block[offset+6])
+			if nameLen > recLen-8 {
+				return fmt.Errorf("directory inode %d, block %d: invalid name_len %d at offset %d", dirInode, blockNum, nameLen, offset)
+			}
 			entryName := string(block[offset+8 : offset+8+nameLen])
 
 			if entryName == name {
@@ -200,7 +219,7 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 				} else {
 					// Not first entry: expand previous entry's rec_len
 					prevRecLen := binary.LittleEndian.Uint16(block[prevOffset+4:])
-					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+recLen)
+					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+uint16(recLen))
 				}
 
 				if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
@@ -211,7 +230,7 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 			}
 
 			prevOffset = offset
-			offset += int(recLen)
+			offset += recLen
 		}
 	}
 
@@ -270,46 +289,81 @@ func (b *builder) readAllEntries(dirInode uint32) ([]dirEntry, uint32, error) {
 	return entries, parentInode, nil
 }
 
-// parseDirentBlock returns the real entries in a directory block and the parent
-// inode if the block carries a ".." record (0 otherwise). Because it feeds the
-// destructive flatten/rebuild of foreign directories, it validates rec_len and
-// name_len against the block bounds, erroring on a malformed on-disk dirent rather
-// than slicing out of bounds and panicking.
-func parseDirentBlock(block []byte, dirInode uint32) ([]dirEntry, uint32, error) {
-	var (
-		entries     []dirEntry
-		parentInode uint32
-	)
+// dirRecord is one live (inode != 0) directory record yielded by walkDirentBlock.
+// name aliases the underlying block buffer; a caller that retains it must copy.
+type dirRecord struct {
+	offset   int
+	recLen   int
+	inode    uint32
+	nameLen  int
+	fileType uint8
+	name     []byte
+}
+
+// walkDirentBlock is the single validated scanner for a directory data block. It
+// follows the rec_len chain, stops at the terminating zero rec_len, and invokes
+// fn for every live record. It applies the same bounds checks for every caller —
+// rejecting a truncated header, a rec_len that is too small, misaligned, or runs
+// past the block end, and a name_len that overflows its record — so no scanner
+// ever slices a malformed on-disk dirent out of bounds. fn may return an error to
+// abort the walk.
+func walkDirentBlock(block []byte, fn func(rec dirRecord) error) error {
 	for offset := 0; offset < blockSize; {
 		if offset+8 > blockSize {
-			return nil, 0, fmt.Errorf("directory inode %d: truncated dirent at offset %d", dirInode, offset)
+			return fmt.Errorf("truncated dirent at offset %d", offset)
 		}
 		recLen := int(binary.LittleEndian.Uint16(block[offset+4:]))
 		if recLen == 0 {
 			break
 		}
 		if recLen < 8 || recLen%4 != 0 || offset+recLen > blockSize {
-			return nil, 0, fmt.Errorf("directory inode %d: invalid rec_len %d at offset %d", dirInode, recLen, offset)
+			return fmt.Errorf("invalid rec_len %d at offset %d", recLen, offset)
 		}
 
 		if entryInode := binary.LittleEndian.Uint32(block[offset:]); entryInode != 0 {
 			nameLen := int(block[offset+6])
 			if nameLen > recLen-8 {
-				return nil, 0, fmt.Errorf("directory inode %d: invalid name_len %d at offset %d", dirInode, nameLen, offset)
+				return fmt.Errorf("invalid name_len %d at offset %d", nameLen, offset)
 			}
-			name := string(block[offset+8 : offset+8+nameLen])
-
-			switch name {
-			case ".":
-				// The directory's own inode; callers re-synthesize it.
-			case "..":
-				parentInode = entryInode
-			default:
-				entries = append(entries, dirEntry{Inode: entryInode, Type: block[offset+7], Name: []byte(name)})
+			if err := fn(dirRecord{
+				offset:   offset,
+				recLen:   recLen,
+				inode:    entryInode,
+				nameLen:  nameLen,
+				fileType: block[offset+7],
+				name:     block[offset+8 : offset+8+nameLen],
+			}); err != nil {
+				return err
 			}
 		}
 
 		offset += recLen
+	}
+	return nil
+}
+
+// parseDirentBlock returns the real entries in a directory block and the parent
+// inode if the block carries a ".." record (0 otherwise). It walks the block
+// through walkDirentBlock, so a malformed on-disk dirent surfaces as an error
+// rather than an out-of-bounds slice.
+func parseDirentBlock(block []byte, dirInode uint32) ([]dirEntry, uint32, error) {
+	var (
+		entries     []dirEntry
+		parentInode uint32
+	)
+	err := walkDirentBlock(block, func(rec dirRecord) error {
+		switch name := string(rec.name); name {
+		case ".":
+			// The directory's own inode; callers re-synthesize it.
+		case "..":
+			parentInode = rec.inode
+		default:
+			entries = append(entries, dirEntry{Inode: rec.inode, Type: rec.fileType, Name: []byte(name)})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("directory inode %d: %w", dirInode, err)
 	}
 	return entries, parentInode, nil
 }
@@ -334,21 +388,18 @@ func (b *builder) findEntry(dirInode uint32, name string) (uint32, error) {
 			return 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 		}
 
-		offset := 0
-		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
-				break
+		var found uint32
+		err := walkDirentBlock(block, func(rec dirRecord) error {
+			if found == 0 && string(rec.name) == name {
+				found = rec.inode
 			}
-
-			nameLen := int(block[offset+6])
-			entryName := string(block[offset+8 : offset+8+nameLen])
-
-			if entryName == name {
-				return binary.LittleEndian.Uint32(block[offset:]), nil
-			}
-
-			offset += int(recLen)
+			return nil
+		})
+		if err != nil {
+			return 0, fmt.Errorf("directory inode %d, block %d: %w", dirInode, blockNum, err)
+		}
+		if found != 0 {
+			return found, nil
 		}
 	}
 
@@ -377,30 +428,15 @@ func (b *builder) listDirEntries(dirInode uint32) ([]dirEntry, error) {
 			return nil, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
 		}
 
-		offset := 0
-		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
-				break
+		err := walkDirentBlock(block, func(rec dirRecord) error {
+			// Skip "." and ".."
+			if name := string(rec.name); name != "." && name != ".." {
+				entries = append(entries, dirEntry{Inode: rec.inode, Type: rec.fileType, Name: []byte(name)})
 			}
-
-			entryInode := binary.LittleEndian.Uint32(block[offset:])
-			if entryInode != 0 {
-				nameLen := int(block[offset+6])
-				entryName := string(block[offset+8 : offset+8+nameLen])
-				entryType := block[offset+7]
-
-				// Skip "." and ".."
-				if entryName != "." && entryName != ".." {
-					entries = append(entries, dirEntry{
-						Inode: entryInode,
-						Type:  entryType,
-						Name:  []byte(entryName),
-					})
-				}
-			}
-
-			offset += int(recLen)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("directory inode %d, block %d: %w", dirInode, blockNum, err)
 		}
 	}
 

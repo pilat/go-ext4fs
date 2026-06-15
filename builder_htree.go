@@ -28,13 +28,16 @@ const (
 	dxEntryArrayOffset = 0x28 // dx_entry[1..] {hash u32, block u32}
 )
 
-// errHtreeDepth1Exceeded is the typed sentinel emitHtree returns when the entry
-// set cannot be represented as a depth-1 htree — either more than dxRootLimit
-// leaves, or a single hash-collision group too large for one leaf. emitHtree
-// guarantees NO side effects in this case (it is detected during the compute
-// phase, before any block is freed or allocated), so the caller can safely leave
-// the directory linear (own images) or refuse the mutation (foreign images).
-var errHtreeDepth1Exceeded = errors.New("directory does not fit a depth-1 htree")
+// errHtreeNotIndexable is the typed sentinel signalling that a directory cannot be
+// represented as a depth-1 htree and must be LEFT LINEAR (which, after flatten, it
+// already is). It covers every "cannot index, not an error" reason: an empty set,
+// more than dxRootLimit leaves, a single hash-collision group too large for one
+// leaf, an unsupported hash version, or not enough free space to grow the index.
+// emitHtree guarantees NO side effects in all of these cases (each is detected
+// before any block is freed or allocated), so emitHtreeDirs has one uniform
+// "skip and stay linear" branch for own and foreign directories alike; only genuine
+// I/O errors propagate and abort Save.
+var errHtreeNotIndexable = errors.New("directory cannot be indexed as a depth-1 htree")
 
 // hashedEntry pairs a directory entry with its computed (major, minor) hash.
 type hashedEntry struct {
@@ -64,7 +67,7 @@ func dirRecLen(nameLen int) int {
 // major hash are never split across leaves (the canonical-layout rule that lets us
 // clear every stored boundary's low bit and never need the htree continuation
 // flag); leaf boundaries fall only between distinct major-hash values. It returns
-// errHtreeDepth1Exceeded if any single same-hash group exceeds one leaf.
+// errHtreeNotIndexable if any single same-hash group exceeds one leaf.
 // leafCapacity is the usable dirent bytes per leaf (blockSize with csum off).
 func packHtreeLeaves(hes []hashedEntry, leafCapacity int) ([]htreeLeafPlan, error) {
 	var (
@@ -93,7 +96,7 @@ func packHtreeLeaves(hes []hashedEntry, leafCapacity int) ([]htreeLeafPlan, erro
 		if groupBytes > leafCapacity {
 			// A single hash value with more colliding entries than fit in one
 			// leaf cannot be represented depth-1 with the clear-low-bit strategy.
-			return nil, errHtreeDepth1Exceeded
+			return nil, errHtreeNotIndexable
 		}
 
 		if curBytes+groupBytes > leafCapacity {
@@ -125,12 +128,17 @@ func liveEntryBytes(entries []dirEntry) int {
 }
 
 // emitHtreeDirs is the single htree-write site, run by Save before
-// finalizeMetadata (so block allocation precedes free-count finalization,
-// decision 6). For each registered directory whose live entries exceed one leaf
-// block it attempts a depth-1 htree emit; directories that fit one leaf stay
-// linear, and own directories that exceed the depth-1 bound fall back to linear
-// (a foreign directory that no longer fits is an error). Only own-origin indexing
-// sets dirIndexUsed, which in turn records the dir_index feature and signedness.
+// finalizeMetadata (so index allocation precedes free-count finalization,
+// decision 6). Indexing is a best-effort OPTIMIZATION: each registered directory
+// whose live entries exceed one leaf block is rebuilt as a depth-1 htree when it
+// can be, and any directory that cannot be — it fits one block, exceeds the
+// depth-1 bound, has an oversized same-hash group, uses an unsupported hash
+// version, or the image is out of free blocks — is LEFT LINEAR (which, after a
+// mutation's flatten, it already is) and the loop continues. Own and foreign
+// directories are treated identically; only own-origin indexing sets dirIndexUsed
+// (which records the dir_index feature and signedness). Only genuine I/O errors
+// propagate, so finalizeMetadata always runs and every directory in the final
+// image is valid.
 func (b *builder) emitHtreeDirs() error {
 	inodes := make([]uint32, 0, len(b.reindexDirs))
 	for ino := range b.reindexDirs {
@@ -141,10 +149,10 @@ func (b *builder) emitHtreeDirs() error {
 	sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
 
 	for _, dirInode := range inodes {
-		info := b.reindexDirs[dirInode]
-
 		// The directory may have been deleted (or its inode reused) during the
-		// session; skip anything that is no longer a live directory.
+		// session; skip anything that is no longer a live directory. Loading the
+		// inode here once (with its liveness) and passing it down avoids the
+		// per-dir re-reads readAllEntries and commitHtreeLayout used to do.
 		allocated, err := b.isInodeAllocated(dirInode)
 		if err != nil {
 			return err
@@ -152,78 +160,130 @@ func (b *builder) emitHtreeDirs() error {
 		if !allocated {
 			continue
 		}
-		ino, err := b.readInode(dirInode)
+		inode, err := b.readInode(dirInode)
 		if err != nil {
 			return err
 		}
-		if ino.Mode&0xF000 != s_IFDIR {
+		if inode.Mode&0xF000 != s_IFDIR {
 			continue
 		}
 
-		entries, parent, err := b.readAllEntries(dirInode)
-		if err != nil {
-			return fmt.Errorf("failed to read directory %d for htree emit: %w", dirInode, err)
-		}
-		if liveEntryBytes(entries) <= blockSize {
-			continue // fits one leaf block — stay linear
-		}
-
-		version := b.defHashVersion
-		if info.foreign {
-			version = info.hashVersion
-		}
-
-		err = b.emitHtree(dirInode, parent, entries, b.hashSeed, version, b.signedHash)
-		if errors.Is(err, errHtreeDepth1Exceeded) {
-			if info.foreign {
-				return fmt.Errorf("foreign htree directory %d no longer fits a depth-1 htree", dirInode)
-			}
-			continue // own oversized directory stays linear (no regression)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to emit htree for directory %d: %w", dirInode, err)
-		}
-
-		if !info.foreign {
-			b.dirIndexUsed = true
+		if err := b.indexDir(dirInode, inode, b.reindexDirs[dirInode]); err != nil {
+			return err // best-effort skips return nil; only real I/O errors reach here
 		}
 	}
 
 	return nil
 }
 
-// emitHtree rebuilds dirInode as a valid depth-1 htree containing exactly entries
-// (which must exclude "." and ".."). It computes the leaf layout first and returns
-// errHtreeDepth1Exceeded WITHOUT side effects if the set does not fit depth-1;
-// otherwise it reconciles the directory to its exact new size by freeing all of
-// its current data/extent blocks and reallocating K+1 contiguous-where-possible
-// blocks (logical 0..K), writes the dx_root and leaves, and sets EXT4_INDEX_FL,
+// indexDir attempts to (re)index one live directory as a depth-1 htree, reusing the
+// inode already loaded by emitHtreeDirs. Any reason the directory cannot be indexed
+// leaves it linear and returns nil (indexing is an optimization); only genuine I/O
+// errors are returned.
+func (b *builder) indexDir(dirInode uint32, inode *inode, info reindexInfo) error {
+	entries, parent, err := b.dirEntriesFromInode(inode, dirInode)
+	if err != nil {
+		return fmt.Errorf("failed to read directory %d for htree emit: %w", dirInode, err)
+	}
+	if liveEntryBytes(entries) <= blockSize {
+		return nil // fits one leaf block — stay linear
+	}
+
+	version := b.defHashVersion
+	if info.foreign {
+		version = info.hashVersion
+	}
+
+	err = b.emitHtree(dirInode, inode, parent, entries, version)
+	if errors.Is(err, errHtreeNotIndexable) {
+		return nil // cannot index (own or foreign) — leave it linear
+	}
+	if err != nil {
+		return fmt.Errorf("failed to emit htree for directory %d: %w", dirInode, err)
+	}
+
+	if !info.foreign {
+		b.dirIndexUsed = true
+	}
+	return nil
+}
+
+// dirEntriesFromInode enumerates a directory's real entries (excluding "." and
+// "..") and recovers its parent inode from the ".." record, working from an
+// already-loaded inode so the emit loop does not re-read the inode and bitmap that
+// readAllEntries would. It mirrors readAllEntries' block scan over the loaded inode.
+func (b *builder) dirEntriesFromInode(inode *inode, dirInode uint32) ([]dirEntry, uint32, error) {
+	dataBlocks, err := b.getInodeBlocks(inode)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get directory blocks: %w", err)
+	}
+
+	var (
+		entries     []dirEntry
+		parentInode uint32
+	)
+	for _, blockNum := range dataBlocks {
+		block := make([]byte, blockSize)
+		if err := b.disk.readAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
+			return nil, 0, fmt.Errorf("failed to read directory block %d: %w", blockNum, err)
+		}
+		blockEntries, parent, err := parseDirentBlock(block, dirInode)
+		if err != nil {
+			return nil, 0, err
+		}
+		entries = append(entries, blockEntries...)
+		if parent != 0 {
+			parentInode = parent
+		}
+	}
+	if parentInode == 0 {
+		return nil, 0, fmt.Errorf("directory inode %d has no .. entry", dirInode)
+	}
+	return entries, parentInode, nil
+}
+
+// emitHtree rebuilds dirInode (whose loaded inode is passed in) as a valid depth-1
+// htree containing exactly entries (which must exclude "." and ".."). It computes
+// the leaf layout first and returns errHtreeNotIndexable WITHOUT side effects if the
+// directory cannot be indexed depth-1 — an empty set, an unsupported hash version,
+// an oversized same-hash group, more than dxRootLimit leaves, or not enough free
+// space to grow the index. Otherwise it reconciles the directory to its exact new
+// size (logical blocks 0..K), writes the dx_root and leaves, and sets EXT4_INDEX_FL,
 // i_size and i_blocks.
 //
 // version is the base hash version stored in dx_root_info (e.g. hashVersionHalfMD4);
-// signed selects how names are hashed and is conveyed on disk separately via the
-// superblock's signedness flag (the dx_root only records the base version).
-func (b *builder) emitHtree(dirInode, parentInode uint32, entries []dirEntry, seed [4]uint32, version uint8, signed bool) error {
+// names are hashed with the builder's seed and signedness (b.hashSeed/b.signedHash),
+// the latter conveyed on disk separately via the superblock's signedness flag.
+func (b *builder) emitHtree(dirInode uint32, inode *inode, parentInode uint32, entries []dirEntry, version uint8) error {
 	if len(entries) == 0 {
-		return errHtreeDepth1Exceeded
+		return errHtreeNotIndexable
 	}
 
-	effVer := effectiveHashVersion(version, !signed)
+	effVer := effectiveHashVersion(version, !b.signedHash)
 	if !hashVersionSupported(effVer) {
-		return fmt.Errorf("unsupported directory hash version %d", version)
+		return errHtreeNotIndexable // we only hash with half_md4 — leave it linear (#3)
 	}
 
 	// --- Compute phase (no side effects) ---
-	leaves, err := packHtreeLeaves(hashAndSortEntries(entries, seed, effVer), blockSize)
+	leaves, err := packHtreeLeaves(hashAndSortEntries(entries, b.hashSeed, effVer), blockSize)
 	if err != nil {
-		return err
+		return err // errHtreeNotIndexable: an oversized same-hash group
 	}
 	if len(leaves) > dxRootLimit {
-		return errHtreeDepth1Exceeded
+		return errHtreeNotIndexable
+	}
+
+	// Capacity guard: if indexing would have to grow the directory (its current
+	// contiguous run cannot be reused in place) but the image is out of free blocks,
+	// leave it linear rather than aborting Save on ENOSPC (#1/#2). Checked here, in
+	// the side-effect-free compute phase, so the directory is never partially rebuilt.
+	total := uint32(len(leaves) + 1)
+	if _, count, ok := singleExtentRun(inode); (!ok || count < total) && !b.canAllocate(total) {
+		return errHtreeNotIndexable
 	}
 
 	// --- Commit phase ---
-	return b.commitHtreeLayout(dirInode, parentInode, version, leaves)
+	return b.commitHtreeLayout(dirInode, inode, parentInode, version, leaves)
 }
 
 // hashAndSortEntries computes each entry's (major, minor) hash and returns them
@@ -246,16 +306,11 @@ func hashAndSortEntries(entries []dirEntry, seed [4]uint32, effVer uint8) []hash
 	return hes
 }
 
-// commitHtreeLayout reconciles dirInode to the planned leaves: it frees all of the
-// directory's current data/extent blocks (preserving the xattr block), reallocates
-// K+1 contiguous-where-possible blocks, writes the leaves and dx_root, and updates
-// the inode (EXT4_INDEX_FL, i_size, i_blocks).
-func (b *builder) commitHtreeLayout(dirInode, parentInode uint32, version uint8, leaves []htreeLeafPlan) error {
-	inode, err := b.readInode(dirInode)
-	if err != nil {
-		return fmt.Errorf("failed to read directory inode for htree emit: %w", err)
-	}
-
+// commitHtreeLayout reconciles dirInode (loaded inode passed in) to the planned
+// leaves: it secures K+1 blocks for logical 0..K (reusing the directory's current
+// run in place where it fits, else allocating fresh and freeing the old), writes the
+// leaves and dx_root, and updates the inode (EXT4_INDEX_FL, i_size, i_blocks).
+func (b *builder) commitHtreeLayout(dirInode uint32, inode *inode, parentInode uint32, version uint8, leaves []htreeLeafPlan) error {
 	total := uint32(len(leaves) + 1) // dx_root + K leaves
 	blocks, err := b.reconcileDirBlocks(inode, total)
 	if err != nil {
@@ -284,23 +339,20 @@ func (b *builder) commitHtreeLayout(dirInode, parentInode uint32, version uint8,
 	return nil
 }
 
-// reconcileDirBlocks frees all of a directory's current data/extent blocks
-// (preserving its xattr block) and reallocates exactly total contiguous-where-
-// possible blocks, mapping them and recomputing i_blocks: data blocks plus the
-// preserved xattr block, with the extent writer adding any extent-tree metadata it
-// allocates. It returns the freshly mapped blocks. Shared by the htree emit and
-// flatten paths, which only differ in what they write into the blocks.
+// reconcileDirBlocks resizes a directory to exactly total blocks and maps them as
+// logical 0..total-1, recomputing i_blocks (data blocks plus any preserved xattr
+// block, with the extent writer adding any extent-tree metadata it allocates). The
+// block swap is atomic: the directory's current blocks are never freed until the new
+// layout is secured (see atomicDirBlockSwap), so an allocation failure leaves the
+// directory exactly as it was. It returns the mapped blocks. Shared by the htree
+// emit and flatten paths, which only differ in what they write into the blocks.
 func (b *builder) reconcileDirBlocks(inode *inode, total uint32) ([]uint32, error) {
-	if err := b.freeInodeExtentRuns(inode); err != nil {
-		return nil, fmt.Errorf("failed to free directory blocks: %w", err)
-	}
-	b.initExtentHeader(inode)
-
-	blocks, err := b.allocateBlocks(total)
+	blocks, err := b.atomicDirBlockSwap(inode, total)
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate directory blocks: %w", err)
+		return nil, err
 	}
 
+	b.initExtentHeader(inode)
 	inode.BlocksLo = total * (blockSize / 512)
 	if inode.FileACLLo != 0 {
 		inode.BlocksLo += blockSize / 512
@@ -309,6 +361,84 @@ func (b *builder) reconcileDirBlocks(inode *inode, total uint32) ([]uint32, erro
 		return nil, fmt.Errorf("failed to map directory blocks: %w", err)
 	}
 	return blocks, nil
+}
+
+// atomicDirBlockSwap returns the total physical blocks a directory should occupy,
+// performing the swap without ever leaving the inode pointing at freed blocks.
+//
+// In-place reuse: a directory stored as a single contiguous extent (every
+// own-emitted directory is) that already spans at least total blocks keeps its first
+// total blocks and frees only the surplus tail. No allocation happens, so this can
+// never fail mid-swap, the directory never relocates, and the bytes stay identical
+// to the previous best-fit-reuse behavior — which keeps re-emit and denser-repack
+// byte-stable (#8). A single contiguous extent has no extent-tree metadata, so
+// freeing the tail leaks nothing.
+//
+// Otherwise (growth, or a multi-extent/tree directory): allocate the new blocks
+// FIRST, then free the old ones. On allocation failure nothing has been freed and
+// the inode still references its original blocks, leaving the directory valid (#1).
+// emit may relocate the directory here; the old blocks return to the free pool and
+// free counts stay correct.
+func (b *builder) atomicDirBlockSwap(inode *inode, total uint32) ([]uint32, error) {
+	if start, count, ok := singleExtentRun(inode); ok && count >= total {
+		if count > total {
+			if err := b.freeBlockRun(start+total, count-total); err != nil {
+				return nil, fmt.Errorf("failed to free surplus directory blocks: %w", err)
+			}
+		}
+		blocks := make([]uint32, total)
+		for i := range blocks {
+			blocks[i] = start + uint32(i)
+		}
+		return blocks, nil
+	}
+
+	blocks, err := b.allocateBlocks(total)
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate directory blocks: %w", err)
+	}
+	if err := b.freeInodeExtentRuns(inode); err != nil {
+		return nil, fmt.Errorf("failed to free directory blocks: %w", err)
+	}
+	return blocks, nil
+}
+
+// singleExtentRun reports whether the inode maps its data as exactly one contiguous
+// extent stored inline (depth 0, one entry) and, if so, returns that run's physical
+// start and block count. This is the shape of every htree directory we emit, so it
+// identifies the directories eligible for in-place block reuse.
+func singleExtentRun(inode *inode) (start, count uint32, ok bool) {
+	if binary.LittleEndian.Uint16(inode.Block[0:2]) != extentMagic {
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint16(inode.Block[6:8]) != 0 { // depth must be 0
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint16(inode.Block[2:4]) != 1 { // exactly one extent
+		return 0, 0, false
+	}
+	length := binary.LittleEndian.Uint16(inode.Block[16:18])
+	physical := binary.LittleEndian.Uint32(inode.Block[20:24])
+	return physical, uint32(length), true
+}
+
+// canAllocate reports whether allocateBlocks(n) would succeed WITHOUT allocating or
+// touching the disk, mirroring its success condition: one free run large enough, or
+// enough fresh blocks across the groups. emit uses it to leave a directory linear
+// when indexing would have to grow it but the image is full, instead of aborting
+// Save on ENOSPC.
+func (b *builder) canAllocate(n uint32) bool {
+	for _, r := range b.freeRuns {
+		if r.count >= n {
+			return true
+		}
+	}
+	var fresh uint32
+	for g := uint32(0); g < b.layout.GroupCount; g++ {
+		gl := b.layout.GetGroupLayout(g)
+		fresh += gl.GroupStart + gl.BlocksInGroup - b.nextBlockPerGroup[g]
+	}
+	return fresh >= n
 }
 
 // writeDxRoot writes the depth-1 dx_root into logical block 0. Leaf i occupies

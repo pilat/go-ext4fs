@@ -92,8 +92,8 @@ func TestPackHtreeLeavesBoundaryAndGrouping(t *testing.T) {
 func TestPackHtreeLeavesSingleGroupTooBig(t *testing.T) {
 	hes := []hashedEntry{he(7, 1, "a"), he(7, 2, "b"), he(7, 3, "c")} // 36 bytes, all major 7
 	_, err := packHtreeLeaves(hes, 24)
-	if !errors.Is(err, errHtreeDepth1Exceeded) {
-		t.Fatalf("got %v, want errHtreeDepth1Exceeded", err)
+	if !errors.Is(err, errHtreeNotIndexable) {
+		t.Fatalf("got %v, want errHtreeNotIndexable", err)
 	}
 }
 
@@ -225,9 +225,13 @@ func TestEmitHtreeSentinelNoSideEffects(t *testing.T) {
 
 	before := captureDirSnapshot(t, img, dInode)
 
-	err = b.emitHtree(dInode, RootInode, infeasibleEntries(8000), b.hashSeed, b.defHashVersion, b.signedHash)
-	if !errors.Is(err, errHtreeDepth1Exceeded) {
-		t.Fatalf("emitHtree = %v, want errHtreeDepth1Exceeded", err)
+	ino, err := b.readInode(dInode)
+	if err != nil {
+		t.Fatalf("readInode: %v", err)
+	}
+	err = b.emitHtree(dInode, ino, RootInode, infeasibleEntries(8000), b.defHashVersion)
+	if !errors.Is(err, errHtreeNotIndexable) {
+		t.Fatalf("emitHtree = %v, want errHtreeNotIndexable", err)
 	}
 
 	before.assertUnchanged(t, captureDirSnapshot(t, img, dInode))
@@ -420,5 +424,242 @@ func TestAddDirEntryRefusesDepth2(t *testing.T) {
 	err = b.addDirEntry(dInode, dirEntry{Inode: 11, Type: ftRegFile, Name: []byte("newentry")})
 	if err == nil || !strings.Contains(err.Error(), "depth-2") {
 		t.Fatalf("addDirEntry on depth-2 directory = %v, want a depth-2 refusal", err)
+	}
+}
+
+func sumFreedBlocks(b *builder) uint32 {
+	var s uint32
+	for _, n := range b.freedBlocksPerGroup {
+		s += n
+	}
+	return s
+}
+
+func sameBlockList(a, c []uint32) bool {
+	if len(a) != len(c) {
+		return false
+	}
+	for i := range a {
+		if a[i] != c[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestEmitHtreeUnsupportedHashStaysLinear covers finding #3: an own directory whose
+// hash version is one we cannot hash with (e.g. 2 = TEA) must be LEFT LINEAR at
+// Save, not abort it. Indexing is an optimization; a hash we can't compute is just
+// a reason to skip indexing this directory.
+func TestEmitHtreeUnsupportedHashStaysLinear(t *testing.T) {
+	img, err := New(WithMemoryBackend(), WithSizeInMB(16))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := img.builder
+
+	dInode, err := b.createDirectory(RootInode, "d", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("createDirectory: %v", err)
+	}
+	for i := 0; i < 300; i++ { // > one directory block -> indexing is attempted
+		if _, err := b.createFile(dInode, fmt.Sprintf("f%05d", i), []byte("x"), 0644, 0, 0); err != nil {
+			t.Fatalf("createFile: %v", err)
+		}
+	}
+
+	b.defHashVersion = 2 // TEA: unsupported by our half_md4-only hasher
+
+	if err := img.Save(); err != nil {
+		t.Fatalf("Save aborted on an unsupported hash version instead of leaving the dir linear: %v", err)
+	}
+
+	ino, err := b.readInode(dInode)
+	if err != nil {
+		t.Fatalf("readInode: %v", err)
+	}
+	if ino.Flags&inodeFlagIndex != 0 {
+		t.Error("directory with an unsupported hash version must stay linear")
+	}
+}
+
+// TestEmitHtreeENOSPCStaysLinear covers finding #1: when indexing a directory would
+// need to grow it but the image is out of blocks, Save must leave the directory
+// linear (best-effort) and — critically — must NOT free the directory's current
+// blocks (the old free-then-allocate order cross-linked them with the next
+// allocation when the allocation failed). The directory must be byte-for-byte intact
+// and every entry still readable.
+// seedLargeLinearDir builds a fresh 16 MiB memory image with a single
+// subdirectory "d" holding n one-byte files (enough to exceed one directory
+// block) and returns the image plus the directory inode and its current blocks.
+func seedLargeLinearDir(t *testing.T, n int) (img *Image, dInode uint32, blocks []uint32) {
+	t.Helper()
+	img, err := New(WithMemoryBackend(), WithSizeInMB(16))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := img.builder
+	dInode, err = b.createDirectory(RootInode, "d", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("createDirectory: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := b.createFile(dInode, fmt.Sprintf("f%05d", i), []byte("x"), 0644, 0, 0); err != nil {
+			t.Fatalf("createFile: %v", err)
+		}
+	}
+	ino, err := b.readInode(dInode)
+	if err != nil {
+		t.Fatalf("readInode: %v", err)
+	}
+	blocks, err = b.getInodeBlocks(ino)
+	if err != nil {
+		t.Fatalf("getInodeBlocks: %v", err)
+	}
+	return img, dInode, blocks
+}
+
+func TestEmitHtreeENOSPCStaysLinear(t *testing.T) {
+	const n = 300
+	img, dInode, blocksBefore := seedLargeLinearDir(t, n)
+	b := img.builder
+
+	// Drive the allocator to ENOSPC: no fresh blocks, no reusable runs.
+	for g := uint32(0); g < b.layout.GroupCount; g++ {
+		gl := b.layout.GetGroupLayout(g)
+		b.nextBlockPerGroup[g] = gl.GroupStart + gl.BlocksInGroup
+	}
+	b.freeRuns = nil
+	freedBefore := sumFreedBlocks(b)
+
+	if err := img.Save(); err != nil {
+		t.Fatalf("Save aborted at ENOSPC instead of leaving the dir linear: %v", err)
+	}
+
+	ino, err := b.readInode(dInode)
+	if err != nil {
+		t.Fatalf("readInode after: %v", err)
+	}
+	if ino.Flags&inodeFlagIndex != 0 {
+		t.Error("directory must stay linear at ENOSPC, not be indexed")
+	}
+	blocksAfter, err := b.getInodeBlocks(ino)
+	if err != nil {
+		t.Fatalf("getInodeBlocks after: %v", err)
+	}
+	if !sameBlockList(blocksBefore, blocksAfter) {
+		t.Errorf("directory blocks changed across a failed index: %v -> %v", blocksBefore, blocksAfter)
+	}
+	if got := sumFreedBlocks(b); got != freedBefore {
+		t.Errorf("blocks were freed during a failed index (cross-link corruption): freed %d -> %d", freedBefore, got)
+	}
+	names, _, err := b.readAllEntries(dInode)
+	if err != nil {
+		t.Fatalf("readAllEntries: %v", err)
+	}
+	if len(names) != n {
+		t.Errorf("entries lost after failed index: got %d, want %d", len(names), n)
+	}
+}
+
+// writeOversizedLinearDir overwrites dInode with a linear directory holding n
+// distinct 255-char entries — more than the depth-1 htree bound (508 leaves) can
+// represent. It writes the dirent blocks directly because addDirEntry is O(n^2) and
+// n is in the thousands. The entries reference a dummy inode, which is safe because
+// the htree emit rejects the set during its compute phase before dereferencing them.
+func writeOversizedLinearDir(t *testing.T, b *builder, dInode, parent uint32, n int) {
+	t.Helper()
+	suffix := strings.Repeat("x", 250)
+	blocksEntries := [][]dirEntry{{
+		{Inode: dInode, Type: ftDir, Name: []byte(".")},
+		{Inode: parent, Type: ftDir, Name: []byte("..")},
+	}}
+	curBytes := 24
+	for i := 0; i < n; i++ {
+		e := dirEntry{Inode: 11, Type: ftRegFile, Name: []byte(fmt.Sprintf("%05d%s", i, suffix))}
+		rl := dirRecLen(len(e.Name))
+		last := len(blocksEntries) - 1
+		if curBytes+rl > blockSize {
+			blocksEntries = append(blocksEntries, nil)
+			last++
+			curBytes = 0
+		}
+		blocksEntries[last] = append(blocksEntries[last], e)
+		curBytes += rl
+	}
+
+	total := uint32(len(blocksEntries))
+	ino, err := b.readInode(dInode)
+	if err != nil {
+		t.Fatalf("readInode: %v", err)
+	}
+	if err := b.freeInodeExtentRuns(ino); err != nil {
+		t.Fatalf("freeInodeExtentRuns: %v", err)
+	}
+	b.initExtentHeader(ino)
+	blocks, err := b.allocateBlocks(total)
+	if err != nil {
+		t.Fatalf("allocateBlocks(%d): %v", total, err)
+	}
+	ino.BlocksLo = total * (blockSize / 512)
+	if err := b.setExtentMultiple(ino, blocks); err != nil {
+		t.Fatalf("setExtentMultiple: %v", err)
+	}
+	ino.SizeLo = total * blockSize
+	for i, be := range blocksEntries {
+		if err := b.writeDirBlock(blocks[i], be); err != nil {
+			t.Fatalf("writeDirBlock %d: %v", i, err)
+		}
+	}
+	if err := b.writeInode(dInode, ino); err != nil {
+		t.Fatalf("writeInode: %v", err)
+	}
+}
+
+// TestEmitHtreeForeignOverflowBestEffort covers finding #2: a foreign htree
+// directory that no longer fits a depth-1 htree must be left linear (best-effort),
+// not abort Save with a hard error — and an unrelated own directory in the same
+// finalize pass must still be indexed. Foreign and own are treated identically.
+func TestEmitHtreeForeignOverflowBestEffort(t *testing.T) {
+	img, err := New(WithMemoryBackend(), WithSizeInMB(32))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := img.builder
+
+	normal, err := b.createDirectory(RootInode, "normal", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("createDirectory normal: %v", err)
+	}
+	for i := 0; i < 300; i++ {
+		if _, err := b.createFile(normal, fmt.Sprintf("f%05d", i), []byte("x"), 0644, 0, 0); err != nil {
+			t.Fatalf("createFile: %v", err)
+		}
+	}
+
+	foreign, err := b.createDirectory(RootInode, "huge", 0755, 0, 0)
+	if err != nil {
+		t.Fatalf("createDirectory huge: %v", err)
+	}
+	writeOversizedLinearDir(t, b, foreign, RootInode, 8000)
+	b.reindexDirs[foreign] = reindexInfo{foreign: true, hashVersion: hashVersionHalfMD4}
+
+	if err := img.Save(); err != nil {
+		t.Fatalf("Save aborted on an un-indexable foreign dir instead of leaving it linear: %v", err)
+	}
+
+	fIno, err := b.readInode(foreign)
+	if err != nil {
+		t.Fatalf("readInode foreign: %v", err)
+	}
+	if fIno.Flags&inodeFlagIndex != 0 {
+		t.Error("oversized foreign directory must be left linear")
+	}
+	nIno, err := b.readInode(normal)
+	if err != nil {
+		t.Fatalf("readInode normal: %v", err)
+	}
+	if nIno.Flags&inodeFlagIndex == 0 {
+		t.Error("normal directory must still be indexed despite the foreign skip")
 	}
 }

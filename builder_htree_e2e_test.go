@@ -344,6 +344,42 @@ func TestOwnHtreeMultiGroupBackupSB(t *testing.T) {
 	assert.NotZero(t, flags&ext4fs.FlagsSignedHashForTest, "backup SB must carry the signed-hash flag")
 }
 
+// TestRootDirHtreeAutoIndex proves the root directory (inode 2) is htree-indexed
+// at finalize once its entries outgrow a single directory block — the same
+// treatment every subdirectory receives. The root is created in a different code
+// path (createRootDirectory) than ordinary directories, so it must be registered
+// for reindexing independently or a large root stays linear forever.
+func TestRootDirHtreeAutoIndex(t *testing.T) {
+	skipIfNoDocker(t)
+
+	env := newTestEnv(t, 128)
+
+	const n = 500
+	names := make([]string, n)
+	for i := 0; i < n; i++ {
+		names[i] = fmt.Sprintf("rootfile_%05d.txt", i)
+		_, err := env.builder.CreateFile(ext4fs.RootInode, names[i], []byte("x"), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	// Save runs the finalize-time htree emit; read the root inode's on-disk flags
+	// before Close, while the backend is still open.
+	require.NoError(t, env.builder.Save())
+
+	flags, err := env.builder.InodeFlagsForTest(ext4fs.RootInode)
+	require.NoError(t, err)
+	assert.NotZero(t, flags&ext4fs.InodeFlagIndexForTest, "root directory must be htree-indexed, flags=0x%x", flags)
+
+	require.NoError(t, env.builder.Close())
+
+	// Kernel mount (e2fsck-clean) lists every entry plus lost+found.
+	out := env.dockerExecSimple("ls -1 | wc -l")
+	assert.Equal(t, fmt.Sprintf("%d", n+1), lastLine(out), "root must list every file plus lost+found")
+
+	// Exhaustive hash oracle: every entry opens by name through the indexed root.
+	assertAllOpenByName(t, env, ".", names)
+}
+
 // TestFlattenEmitRoundTrip verifies flattenHtree reverses an emit (clearing the
 // index and recovering every entry as linear) and that a subsequent emit rebuilds
 // a valid htree over the identical entry set.
