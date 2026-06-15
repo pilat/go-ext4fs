@@ -111,9 +111,11 @@ func FuzzDirentScan(f *testing.F) {
 			t.Skip()
 		}
 
-		// None of the scanners may panic on a corrupt directory block.
+		// None of the scanners may panic on a corrupt directory block —
+		// including the append path (tryAddEntryToBlock) reached via CreateFile.
 		_, _ = b.findEntry(d, "x")
 		_, _ = b.listDirEntries(d)
 		_ = b.removeDirEntry(d, "x")
+		_, _ = img.CreateFile(d, "new", []byte("z"), 0644, 0, 0)
 	})
 }

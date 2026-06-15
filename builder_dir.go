@@ -118,23 +118,23 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 	lastOffset := 0
 
 	for offset < blockSize {
-		recLen := binary.LittleEndian.Uint16(block[offset+4:])
-		if recLen == 0 {
+		_, recLen, _, _, ok := parseDirentAt(block, offset)
+		if !ok {
 			break
 		}
-
 		lastOffset = offset
-		offset += int(recLen)
+		offset += recLen
 	}
 
-	lastNameLen := int(block[lastOffset+6])
+	_, lastRecLen, lastNameLen, _, ok := parseDirentAt(block, lastOffset)
+	if !ok {
+		return false, fmt.Errorf("corrupt directory block %d", blockNum)
+	}
 
 	lastActualSize := 8 + lastNameLen
 	if lastActualSize%4 != 0 {
 		lastActualSize += 4 - (lastActualSize % 4)
 	}
-
-	lastRecLen := int(binary.LittleEndian.Uint16(block[lastOffset+4:]))
 
 	spaceAvailable := lastRecLen - lastActualSize
 	if spaceAvailable < newRecLen {

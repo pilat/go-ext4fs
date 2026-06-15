@@ -789,11 +789,11 @@ func (b *builder) removeXattr(inodeNum uint32, name string) error {
 // updating group descriptors with accurate counts, and ensuring the superblock
 // reflects the current filesystem state. Must be called after all file operations.
 func (b *builder) finalizeMetadata() error {
-	// Per-group free inodes come straight from each group's bitmap
-	// (calculateGroupStats), so the superblock total is the sum of the per-group
-	// counts rather than a global-cursor formula that cannot see inodes freed below
-	// the allocation high-water mark.
-	var totalFreeInodes uint32
+	// Per-group free counts come straight from each group's bitmaps
+	// (calculateGroupStats), so the superblock totals are the sum of the per-group
+	// counts rather than a global-cursor formula that cannot see blocks or inodes
+	// freed below the allocation high-water mark.
+	var totalFreeBlocks, totalFreeInodes uint32
 
 	for g := uint32(0); g < b.layout.GroupCount; g++ {
 		freeBlocks, freeInodes, itableUnused, err := b.calculateGroupStats(g)
@@ -803,16 +803,8 @@ func (b *builder) finalizeMetadata() error {
 		if err := b.updateGroupDescriptor(g, freeBlocks, freeInodes, b.usedDirsPerGroup[g], itableUnused); err != nil {
 			return err
 		}
+		totalFreeBlocks += uint32(freeBlocks)
 		totalFreeInodes += uint32(freeInodes)
-	}
-
-	// Calculate total free blocks for superblock
-	var totalFreeBlocks uint32
-
-	for g := uint32(0); g < b.layout.GroupCount; g++ {
-		gl := b.layout.GetGroupLayout(g)
-		usedBlocks := b.nextBlockPerGroup[g] - gl.GroupStart - b.freedBlocksPerGroup[g]
-		totalFreeBlocks += gl.BlocksInGroup - usedBlocks
 	}
 
 	if err := b.updateSuperblocks(totalFreeBlocks, totalFreeInodes); err != nil {
