@@ -25,7 +25,6 @@ type builder struct {
 	freedBlocksPerGroup []uint32  // Blocks freed per group (for overwrites)
 	freeRuns            []freeRun // Free block runs sorted by count (ascending) for best-fit
 	nextInode           uint32    // Next free inode (global)
-	freedInodesPerGroup []uint32  // Inodes freed per group (for deletes)
 	freeInodeList       []uint32  // List of freed inodes available for reuse
 
 	// Tracking
@@ -45,7 +44,6 @@ func newBuilder(disk diskBackend, layout *Layout) *builder {
 		freedBlocksPerGroup: make([]uint32, layout.GroupCount),
 		freeRuns:            nil,
 		nextInode:           firstNonResInode,
-		freedInodesPerGroup: make([]uint32, layout.GroupCount),
 		freeInodeList:       make([]uint32, 0),
 		usedDirsPerGroup:    make([]uint16, layout.GroupCount),
 	}
@@ -118,8 +116,11 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 	}
 	b.nextBlockPerGroup[g] = gl.GroupStart + highestUsed + 1
 
-	// Find free block runs (holes)
-	var runStart, runCount uint32
+	// Find free block runs (holes) below the high-water mark. They are reusable
+	// (added to freeRuns) and also recorded as freed, so the free-block count is
+	// correct on reopen of an image whose deleted files left holes below the mark.
+	// For our own sequentially-written images (no holes) this is zero.
+	var runStart, runCount, holes uint32
 	for i := dataStart; i <= highestUsed; i++ {
 		isFree := blockBitmap[i/8]&(1<<(i%8)) == 0
 		if isFree {
@@ -129,12 +130,15 @@ func (b *builder) loadBlockBitmap(g uint32, gl GroupLayout) error {
 			runCount++
 		} else if runCount > 0 {
 			b.addFreeRun(freeRun{start: runStart, count: runCount})
+			holes += runCount
 			runCount = 0
 		}
 	}
 	if runCount > 0 {
 		b.addFreeRun(freeRun{start: runStart, count: runCount})
+		holes += runCount
 	}
+	b.freedBlocksPerGroup[g] = holes
 
 	return nil
 }

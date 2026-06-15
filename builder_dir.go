@@ -118,23 +118,23 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 	lastOffset := 0
 
 	for offset < blockSize {
-		recLen := binary.LittleEndian.Uint16(block[offset+4:])
-		if recLen == 0 {
+		_, recLen, _, _, ok := parseDirentAt(block, offset)
+		if !ok {
 			break
 		}
-
 		lastOffset = offset
-		offset += int(recLen)
+		offset += recLen
 	}
 
-	lastNameLen := int(block[lastOffset+6])
+	_, lastRecLen, lastNameLen, _, ok := parseDirentAt(block, lastOffset)
+	if !ok {
+		return false, fmt.Errorf("corrupt directory block %d", blockNum)
+	}
 
 	lastActualSize := 8 + lastNameLen
 	if lastActualSize%4 != 0 {
 		lastActualSize += 4 - (lastActualSize % 4)
 	}
-
-	lastRecLen := int(binary.LittleEndian.Uint16(block[lastOffset+4:]))
 
 	spaceAvailable := lastRecLen - lastActualSize
 	if spaceAvailable < newRecLen {
@@ -157,6 +157,27 @@ func (b *builder) tryAddEntryToBlock(blockNum uint32, entry dirEntry, newRecLen 
 	}
 
 	return true, nil
+}
+
+// parseDirentAt reads the linear directory entry at offset within a directory
+// block. ok is false when the entry's rec_len or name_len would run past the end
+// of the block — a corrupt or truncated on-disk directory — so callers stop
+// scanning the block instead of slicing out of bounds and panicking.
+func parseDirentAt(block []byte, offset int) (entryInode uint32, recLen, nameLen int, name string, ok bool) {
+	if offset+8 > len(block) {
+		return 0, 0, 0, "", false
+	}
+	recLen = int(binary.LittleEndian.Uint16(block[offset+4:]))
+	if recLen < 8 || offset+recLen > len(block) {
+		return 0, 0, 0, "", false
+	}
+	nameLen = int(block[offset+6])
+	if nameLen > recLen-8 {
+		return 0, 0, 0, "", false
+	}
+	entryInode = binary.LittleEndian.Uint32(block[offset:])
+	name = string(block[offset+8 : offset+8+nameLen])
+	return entryInode, recLen, nameLen, name, true
 }
 
 // removeDirEntry removes a directory entry with the specified name from the directory.
@@ -184,13 +205,10 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 		prevOffset := -1
 
 		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
+			_, recLen, _, entryName, ok := parseDirentAt(block, offset)
+			if !ok {
 				break
 			}
-
-			nameLen := int(block[offset+6])
-			entryName := string(block[offset+8 : offset+8+nameLen])
 
 			if entryName == name {
 				if prevOffset < 0 {
@@ -199,7 +217,7 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 				} else {
 					// Not first entry: expand previous entry's rec_len
 					prevRecLen := binary.LittleEndian.Uint16(block[prevOffset+4:])
-					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+recLen)
+					binary.LittleEndian.PutUint16(block[prevOffset+4:], prevRecLen+uint16(recLen))
 				}
 
 				if err := b.disk.writeAt(block, int64(b.layout.BlockOffset(blockNum))); err != nil {
@@ -210,7 +228,7 @@ func (b *builder) removeDirEntry(dirInode uint32, name string) error {
 			}
 
 			prevOffset = offset
-			offset += int(recLen)
+			offset += recLen
 		}
 	}
 
@@ -239,19 +257,16 @@ func (b *builder) findEntry(dirInode uint32, name string) (uint32, error) {
 
 		offset := 0
 		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
+			entryInode, recLen, _, entryName, ok := parseDirentAt(block, offset)
+			if !ok {
 				break
 			}
 
-			nameLen := int(block[offset+6])
-			entryName := string(block[offset+8 : offset+8+nameLen])
-
 			if entryName == name {
-				return binary.LittleEndian.Uint32(block[offset:]), nil
+				return entryInode, nil
 			}
 
-			offset += int(recLen)
+			offset += recLen
 		}
 	}
 
@@ -282,15 +297,12 @@ func (b *builder) listDirEntries(dirInode uint32) ([]dirEntry, error) {
 
 		offset := 0
 		for offset < blockSize {
-			recLen := binary.LittleEndian.Uint16(block[offset+4:])
-			if recLen == 0 {
+			entryInode, recLen, _, entryName, ok := parseDirentAt(block, offset)
+			if !ok {
 				break
 			}
 
-			entryInode := binary.LittleEndian.Uint32(block[offset:])
 			if entryInode != 0 {
-				nameLen := int(block[offset+6])
-				entryName := string(block[offset+8 : offset+8+nameLen])
 				entryType := block[offset+7]
 
 				// Skip "." and ".."
@@ -303,7 +315,7 @@ func (b *builder) listDirEntries(dirInode uint32) ([]dirEntry, error) {
 				}
 			}
 
-			offset += int(recLen)
+			offset += recLen
 		}
 	}
 

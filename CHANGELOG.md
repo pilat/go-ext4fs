@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-15
+
+### Fixed
+
+- Reopening an image and deleting an entry no longer corrupts the free-block and
+  free-inode counts. The old accounting derived them from the in-session
+  allocation cursors, which reset on reopen, so anything freed below the
+  high-water mark was miscounted as used and `e2fsck` rejected the image; the
+  counts now come straight from the bitmaps.
+- The linear directory scanners reject a corrupt `rec_len`/`name_len` instead of
+  slicing past the directory block and panicking.
+
 ## [1.0.1] - 2026-06-10
 
 ### Added
@@ -50,5 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bracket, reproducible images via `WithCreatedAt`, and `Open` support for
   images created by this library.
 
+[1.0.2]: https://github.com/pilat/go-ext4fs/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/pilat/go-ext4fs/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/pilat/go-ext4fs/releases/tag/v1.0.0
