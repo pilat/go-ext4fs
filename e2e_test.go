@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"os/exec"
@@ -25,8 +27,8 @@ import (
 // =============================================================================
 
 const (
-	// Docker image to use for ext4 validation
-	dockerImage = "alpine:latest"
+	// Docker image to use for ext4 validation (pinned for reproducible e2fsprogs)
+	dockerImage = "alpine:3.21"
 	// Default test image size in MB
 	defaultImageSizeMB = 64
 
@@ -206,6 +208,16 @@ func TestExt4FS(t *testing.T) {
 		{"ResizeGrowAfterShrink", testResizeGrowAfterShrink},
 		{"ResizeOpenGrow", testResizeOpenGrow},
 		{"ResizeOpenShrink", testResizeOpenShrink},
+		{"ChecksumWriteCorrectness", testChecksumWriteCorrectness},
+		{"ChecksumReopenAppend", testChecksumReopenAppend},
+		{"ChecksumForeignAccepts", testChecksumForeignAccepts},
+		{"ChecksumForeignAppend", testChecksumForeignAppend},
+		{"ChecksumForeignCsumSeedAppend", testChecksumForeignCsumSeedAppend},
+		{"ChecksumForeignGeometryRejects", testChecksumForeignGeometryRejects},
+		{"ReopenRejectsReservedGDT", testReopenRejectsReservedGDT},
+		{"ReopenRejectsGdtCsum", testReopenRejectsGdtCsum},
+		{"ChecksumMultiGroupBackups", testChecksumMultiGroupBackups},
+		{"ChecksumDeleteMutate", testChecksumDeleteMutate},
 	}
 
 	for _, tc := range tests {
@@ -3186,6 +3198,278 @@ func assertResizeFixture(t *testing.T, output string) {
 	assert.Contains(t, output, "data.txt")        // symlink target
 	assert.Contains(t, output, "fixture")         // xattr value
 	assert.Contains(t, output, "RESIZE-VERIFY-DONE")
+}
+
+// =============================================================================
+// metadata_csum (WithChecksum) end-to-end tests
+// =============================================================================
+
+// foreignCompatibleMkfsFlags builds a metadata_csum image with mke2fs tuned to
+// this library's geometry (4096 block, 256 inode, 32-byte descriptors, no
+// 64bit/flex_bg). ^metadata_csum_seed keeps these fixtures on the UUID-derived
+// seed path: modern mke2fs otherwise sets INCOMPAT_CSUM_SEED and stores the seed
+// explicitly. We now reopen stored-seed images too — that path is exercised by the
+// metadata_csum_seed tests — so this flag is a deliberate choice of which seed
+// source to test here, not a requirement for the image to open. ^has_journal is
+// required because the journal is an INCOMPAT feature we do not support. -N 8192 on
+// a single-group image forces inodes_per_group to our 8192.
+const foreignCompatibleMkfsFlags = "-b 4096 -I 256 -g 32768 -N 8192 " +
+	"-O ^64bit,^flex_bg,^has_journal,^resize_inode,^metadata_csum_seed," +
+	"metadata_csum,extent,sparse_super,dir_index,filetype,extra_isize"
+
+// castagnoliTestTable backs ext4Crc32c.
+var castagnoliTestTable = crc32.MakeTable(crc32.Castagnoli)
+
+// ext4Crc32c mirrors ext2fs_crc32c_le (explicit seed, no final inversion) for
+// independently verifying a backup superblock checksum in-test.
+func ext4Crc32c(seed uint32, p []byte) uint32 {
+	return ^crc32.Update(^seed, castagnoliTestTable, p)
+}
+
+// mkfsForeignCsumEnv builds an ext4 image with mke2fs inside the shared container
+// (NOT via this library) and returns a testEnv pointing at it on the host, ready
+// to Open from Go. The container already has e2fsprogs installed.
+func mkfsForeignCsumEnv(t *testing.T, flags string, sizeMB int) *testEnv {
+	t.Helper()
+
+	name := fmt.Sprintf("foreign-%d.img", time.Now().UnixNano())
+	env := &testEnv{t: t, imagePath: filepath.Join(sharedHostDir, name)}
+	containerPath := filepath.Join(sharedContainerDir, name)
+
+	script := fmt.Sprintf(
+		"dd if=/dev/zero of=%[1]s bs=1M count=%[2]d status=none && mkfs.ext4 -F -q %[3]s %[1]s && chmod 666 %[1]s",
+		containerPath, sizeMB, flags)
+
+	stdout, stderr, err := env.runInContainer(script)
+	require.NoError(t, err, "mke2fs failed\nstdout: %s\nstderr: %s", stdout, stderr)
+
+	return env
+}
+
+// mkfsForeignCsumSeedImage builds a metadata_csum image (mke2fs enables
+// metadata_csum_seed by default) of our geometry, then changes the UUID with
+// tune2fs so the stored checksum seed is decoupled from the UUID. It returns a
+// testEnv pointing at it on the host.
+func mkfsForeignCsumSeedImage(t *testing.T) *testEnv {
+	t.Helper()
+
+	name := fmt.Sprintf("seed-%d.img", time.Now().UnixNano())
+	env := &testEnv{t: t, imagePath: filepath.Join(sharedHostDir, name)}
+	containerPath := filepath.Join(sharedContainerDir, name)
+
+	script := fmt.Sprintf(
+		"dd if=/dev/zero of=%[1]s bs=1M count=64 status=none && "+
+			"mkfs.ext4 -F -q -b 4096 -I 256 -g 32768 -N 8192 "+
+			"-O ^64bit,^flex_bg,^has_journal,^resize_inode,metadata_csum,extent,sparse_super,dir_index,filetype,extra_isize %[1]s && "+
+			"tune2fs -U 11111111-2222-3333-4444-555555555555 %[1]s && chmod 666 %[1]s",
+		containerPath)
+
+	stdout, stderr, err := env.runInContainer(script)
+	require.NoError(t, err, "mke2fs/tune2fs failed\nstdout: %s\nstderr: %s", stdout, stderr)
+
+	return env
+}
+
+// testChecksumWriteCorrectness builds a checksummed image with files and a
+// subdirectory; the harness's built-in e2fsck -fn + mount is the assertion.
+func testChecksumWriteCorrectness(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithChecksum(), ext4fs.WithSizeInMB(64))
+
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "etc", 0755, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(dir, "hostname", []byte("myhost\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "readme", []byte("hello checksums\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(ext4fs.RootInode, "data", bytes.Repeat([]byte("x"), 12000), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	out := env.dockerExecSimple(`cat etc/hostname`, `cat readme`)
+	assert.Contains(t, out, "myhost")
+	assert.Contains(t, out, "hello checksums")
+	assert.Contains(t, env.dumpe2fsHeader(), "metadata_csum", "feature must actually be set")
+}
+
+// testChecksumReopenAppend proves the consistent-writer property: reopen a
+// checksummed image, append, and the result still passes e2fsck + mount.
+func testChecksumReopenAppend(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithChecksum(), ext4fs.WithSizeInMB(64))
+
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "first.txt", []byte("first\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	dir, err := env.builder.CreateDirectory(ext4fs.RootInode, "sub", 0755, 0, 0)
+	require.NoError(t, err)
+	_, err = env.builder.CreateFile(dir, "nested.txt", []byte("nested\n"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+	_, err = img.CreateFile(ext4fs.RootInode, "second.txt", []byte("second\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, img.Save())
+	require.NoError(t, img.Close())
+
+	out := env.dockerExecSimple(`cat first.txt`, `cat second.txt`, `cat sub/nested.txt`)
+	assert.Contains(t, out, "first")
+	assert.Contains(t, out, "second")
+	assert.Contains(t, out, "nested")
+}
+
+// testChecksumForeignAccepts confirms a foreign mke2fs image carrying
+// metadata_csum but matching our geometry must open.
+func testChecksumForeignAccepts(t *testing.T) {
+	env := mkfsForeignCsumEnv(t, foreignCompatibleMkfsFlags, 64)
+
+	require.Contains(t, env.dumpe2fsHeader(), "metadata_csum", "fixture must carry metadata_csum")
+
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err, "a metadata_csum image of our geometry must open")
+	require.NoError(t, img.Close())
+}
+
+// testChecksumForeignAppend appends to the opened mke2fs image and validates with
+// e2fsck + mount, proving our recipes are byte-identical to e2fsprogs under a
+// foreign UUID seed. (The nonzero-i_generation path is exercised separately by
+// TestForeignNonzeroGenerationAppend, since mke2fs assigns the root directory
+// generation 0.)
+func testChecksumForeignAppend(t *testing.T) {
+	env := mkfsForeignCsumEnv(t, foreignCompatibleMkfsFlags, 64)
+
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err)
+	_, err = img.CreateFile(ext4fs.RootInode, "appended.txt", []byte("from go\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, img.Save())
+	require.NoError(t, img.Close())
+
+	assert.Contains(t, env.dockerExecSimple(`cat appended.txt`), "from go")
+}
+
+// testChecksumForeignCsumSeedAppend ingests a stock mke2fs metadata_csum image
+// whose seed is stored (metadata_csum_seed) and decoupled from the UUID by a
+// tune2fs -U, appends to it, and validates with e2fsck + mount — proving we read
+// and reuse the stored checksum seed rather than the (now-wrong) UUID-derived one.
+func testChecksumForeignCsumSeedAppend(t *testing.T) {
+	env := mkfsForeignCsumSeedImage(t)
+
+	require.Contains(t, env.dumpe2fsHeader(), "metadata_csum_seed", "fixture must carry metadata_csum_seed")
+
+	img, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.NoError(t, err, "a metadata_csum_seed image must open")
+
+	_, err = img.CreateFile(ext4fs.RootInode, "appended.txt", []byte("seeded\n"), 0644, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, img.Save())
+	require.NoError(t, img.Close())
+
+	assert.Contains(t, env.dockerExecSimple(`cat appended.txt`), "seeded")
+}
+
+// testReopenRejectsReservedGDT confirms a foreign image built with online-resize
+// reserved GDT blocks (resize_inode, omitted ^) is refused. Those blocks sit
+// between the GDT and the bitmaps, shifting every per-group metadata offset; our
+// layout assumes none, so reading/rewriting it would corrupt the image.
+func testReopenRejectsReservedGDT(t *testing.T) {
+	env := mkfsForeignCsumEnv(t,
+		"-b 4096 -I 256 -g 32768 -N 8192 -O ^64bit,^flex_bg,^has_journal,metadata_csum,extent", 64)
+
+	require.Contains(t, env.dumpe2fsHeader(), "resize_inode", "fixture must reserve GDT blocks")
+
+	_, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved GDT")
+}
+
+// testReopenRejectsGdtCsum confirms a foreign legacy gdt_csum/uninit_bg image
+// (RO_COMPAT 0x10: crc16 group-descriptor checksums + uninitialized groups we
+// neither maintain nor handle) is refused rather than corrupted on Save.
+func testReopenRejectsGdtCsum(t *testing.T) {
+	env := mkfsForeignCsumEnv(t,
+		"-b 4096 -I 256 -g 32768 -N 8192 -O ^64bit,^flex_bg,^has_journal,^resize_inode,^metadata_csum,uninit_bg", 64)
+
+	require.Contains(t, env.dumpe2fsHeader(), "uninit_bg", "fixture must carry gdt_csum/uninit_bg")
+
+	_, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read-only-compat")
+}
+
+// testChecksumForeignGeometryRejects confirms a foreign image of an unsupported
+// geometry is still rejected for that geometry — not for its checksums.
+func testChecksumForeignGeometryRejects(t *testing.T) {
+	env := mkfsForeignCsumEnv(t, "-b 4096 -O 64bit,flex_bg,metadata_csum", 64)
+
+	_, err := ext4fs.Open(ext4fs.WithExistingImagePath(env.imagePath))
+	require.Error(t, err)
+
+	msg := err.Error()
+	assert.True(t, strings.Contains(msg, "64bit") || strings.Contains(msg, "flex_bg"),
+		"rejection must cite the unsupported geometry, got: %s", msg)
+	assert.NotContains(t, strings.ToLower(msg), "checksum", "must not reject for checksums")
+	assert.NotContains(t, msg, "metadata_csum")
+}
+
+// testChecksumMultiGroupBackups builds a ≥2-group checksummed image (so backup
+// superblocks exist) and verifies a backup's checksum directly, since e2fsck -fn
+// does not reliably re-verify backups. It catches the per-copy s_block_group_nr
+// bug that single-group fixtures can never see.
+func testChecksumMultiGroupBackups(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithChecksum(), ext4fs.WithSizeInMB(256))
+
+	for i := 0; i < 20; i++ {
+		_, err := env.builder.CreateFile(ext4fs.RootInode,
+			fmt.Sprintf("file%02d.txt", i), []byte(fmt.Sprintf("content %d\n", i)), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	env.finalize()
+	env.dockerExecSimple(`ls`) // e2fsck -fn + mount
+
+	// The backup superblock of group 1 sits at byte 0 of block 32768.
+	f, err := os.Open(env.imagePath)
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	backup := make([]byte, 1024)
+	_, err = f.ReadAt(backup, int64(testBlocksPerGroup)*testBlockSize)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint16(1), binary.LittleEndian.Uint16(backup[0x5A:]), "backup s_block_group_nr must be 1")
+	assert.Equal(t, binary.LittleEndian.Uint32(backup[0x3FC:]), ext4Crc32c(0xFFFFFFFF, backup[:0x3FC]),
+		"backup superblock checksum must be valid")
+}
+
+// testChecksumDeleteMutate deletes one entry and overwrites another in a
+// checksummed image, exercising removeDirEntry's tail handling and the
+// stale-det_checksum-after-mutation paths, then validates with e2fsck + mount.
+func testChecksumDeleteMutate(t *testing.T) {
+	env := newTestEnvOpts(t, ext4fs.WithChecksum(), ext4fs.WithSizeInMB(64))
+
+	for _, n := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
+		_, err := env.builder.CreateFile(ext4fs.RootInode, n, []byte("content of "+n+"\n"), 0644, 0, 0)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, env.builder.Delete(ext4fs.RootInode, "b.txt"))
+	_, err := env.builder.CreateFile(ext4fs.RootInode, "c.txt", []byte("overwritten c\n"), 0644, 0, 0)
+	require.NoError(t, err)
+
+	env.finalize()
+
+	out := env.dockerExecSimple(
+		`cat a.txt`,
+		`test -f b.txt && echo "b exists" || echo "b removed"`,
+		`cat c.txt`,
+		`cat d.txt`,
+	)
+	assert.Contains(t, out, "content of a.txt")
+	assert.Contains(t, out, "b removed")
+	assert.Contains(t, out, "overwritten c")
+	assert.Contains(t, out, "content of d.txt")
 }
 
 // =============================================================================

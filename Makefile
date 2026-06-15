@@ -42,5 +42,7 @@ bench:
 	go test -bench=. -benchmem -run=^$ ./...
 
 fuzz:
-	@echo "===> Fuzzing (60s)"
-	go test $(LDFLAGS) -run=^$$ -fuzz=FuzzOps -fuzztime=60s .
+	@echo "===> Fuzzing FuzzOps (60s)"
+	go test $(LDFLAGS) -run=^$$ -fuzz=^FuzzOps$$ -fuzztime=60s .
+	@echo "===> Fuzzing FuzzChecksumOps (60s)"
+	go test $(LDFLAGS) -run=^$$ -fuzz=^FuzzChecksumOps$$ -fuzztime=60s .

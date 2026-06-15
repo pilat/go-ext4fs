@@ -71,6 +71,12 @@ const (
 	ftSymlink = 7
 	ftMax     = 8
 
+	// ext4_dir_entry_tail (metadata_csum): a fake "deleted" entry occupying the
+	// last 12 bytes of every directory block. Its file_type byte is the sentinel
+	// 0xDE; the trailing 4 bytes hold the block's det_checksum.
+	dirEntryTailType = 0xDE
+	dirEntryTailSize = 12
+
 	// Inode mode bits
 	s_IXOTH  = 0o0001
 	s_IWOTH  = 0o0002
@@ -118,8 +124,14 @@ const (
 	incompatFlexBG  = 0x0200  // flex_bg
 	incompatEncrypt = 0x10000 // encrypt
 
+	// incompatCsumSeed (metadata_csum_seed): the checksum seed is stored in
+	// s_checksum_seed rather than derived from the UUID. We support reopening such
+	// images by reading the stored seed; the superblock read-modify-write on Save
+	// preserves both the feature bit and the seed field.
+	incompatCsumSeed = 0x2000
+
 	// Mask of incompatible features we support
-	incompatSupported = incompatFileType | incompatExtents
+	incompatSupported = incompatFileType | incompatExtents | incompatCsumSeed
 
 	// Read-only compatible features
 	roCompatSparseSuper  = 0x0001
@@ -132,14 +144,17 @@ const (
 	roCompatBigalloc     = 0x0200 // cluster (not block) bitmaps we would misread
 	roCompatMetadataCsum = 0x0400 // images we cannot safely modify without csum support
 
-	// Mask of read-only-compatible features Open tolerates. These are purely
-	// descriptive flags that Save never invalidates: they need no per-block
-	// maintenance, so preserving them across a free-count rewrite is safe. Every
-	// other ro_compat bit (gdt_csum, bigalloc, quota, metadata_csum) demands
-	// maintenance we don't do and is refused on Open. Both our own images
-	// (sparse_super|large_file|extra_isize) and real mke2fs images
-	// (additionally huge_file|dir_nlink) are subsets of this mask.
-	roCompatSupported = roCompatSparseSuper | roCompatLargeFile | roCompatHugeFile | roCompatDirNlink | roCompatExtraIsize
+	// Mask of read-only-compatible features Open tolerates. sparse_super, large_file,
+	// huge_file, dir_nlink and extra_isize are purely descriptive flags Save never
+	// invalidates. metadata_csum is also tolerated because this library maintains its
+	// checksums on every write (csumEnabled is set from the on-disk feature on Open),
+	// so a reopened checksummed image stays valid. Every other ro_compat bit (gdt_csum,
+	// bigalloc, quota) demands maintenance we don't do and is refused on Open.
+	roCompatSupported = roCompatSparseSuper | roCompatLargeFile | roCompatHugeFile |
+		roCompatDirNlink | roCompatExtraIsize | roCompatMetadataCsum
+
+	// s_checksum_type value selecting CRC32C for metadata_csum.
+	checksumTypeCRC32C = 1
 
 	// Reserved GDT blocks (resize_inode) field in the superblock (offset 0xCE).
 	// A non-zero value shifts every per-group metadata offset, which our geometry
