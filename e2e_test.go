@@ -2541,7 +2541,7 @@ func testOpenInvalidImage(t *testing.T) {
 	out, err := os.Create(standardHostPath)
 	require.NoError(t, err)
 	cmd := exec.Command("docker", "exec", dockerContainerID,
-		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M && cat %s", standardImgPath, standardImgPath))
+		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M >/dev/null && cat %s", standardImgPath, standardImgPath))
 	cmd.Stdout = out
 	runErr := cmd.Run()
 	require.NoError(t, out.Close())
