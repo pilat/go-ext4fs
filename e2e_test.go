@@ -2545,12 +2545,12 @@ func testOpenInvalidImage(t *testing.T) {
 	cmd.Stdout = out
 	runErr := cmd.Run()
 	require.NoError(t, out.Close())
-	if runErr == nil {
-		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unsupported filesystem features")
-		assert.Contains(t, err.Error(), "only images created by this library are supported")
-	}
+	require.NoError(t, runErr)
+
+	_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported filesystem features")
+	assert.Contains(t, err.Error(), "only images created by this library are supported")
 }
 
 // testLargeFileAfterDeletes verifies that creating a large file after deleting
