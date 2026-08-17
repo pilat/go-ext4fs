@@ -37,7 +37,7 @@ const (
 	fixturesCreatedAt = uint32(1600000000)
 	expectedSHA256Hex = "391d60c1629a4062d7b922da1083b1b0db6bcc624fdf3310db785f2634044025"
 
-	// Directory inside the Docker container where host images are mounted.
+	// Directory inside the Docker container where test images are copied.
 	sharedContainerDir = "/ext4-images"
 
 	// ext4 geometry invariants, mirrored here for resize target math.
@@ -2537,15 +2537,20 @@ func testOpenInvalidImage(t *testing.T) {
 	// Test opening standard ext4 image (created by mke2fs with default features)
 	// Standard mke2fs enables features like 64bit, flex_bg, etc. that we don't support
 	standardImgPath := filepath.Join(sharedContainerDir, "standard.img")
+	standardHostPath := filepath.Join(sharedHostDir, "standard.img")
+	out, err := os.Create(standardHostPath)
+	require.NoError(t, err)
 	cmd := exec.Command("docker", "exec", dockerContainerID,
-		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M && chmod 666 %s", standardImgPath, standardImgPath))
-	if err := cmd.Run(); err == nil {
-		standardHostPath := filepath.Join(sharedHostDir, "standard.img")
-		_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unsupported filesystem features")
-		assert.Contains(t, err.Error(), "only images created by this library are supported")
-	}
+		"sh", "-c", fmt.Sprintf("mke2fs -t ext4 -q %s 64M >/dev/null && cat %s", standardImgPath, standardImgPath))
+	cmd.Stdout = out
+	runErr := cmd.Run()
+	require.NoError(t, out.Close())
+	require.NoError(t, runErr)
+
+	_, err = ext4fs.Open(ext4fs.WithExistingImagePath(standardHostPath))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported filesystem features")
+	assert.Contains(t, err.Error(), "only images created by this library are supported")
 }
 
 // testLargeFileAfterDeletes verifies that creating a large file after deleting
@@ -3217,8 +3222,8 @@ type testEnv struct {
 }
 
 // newTestEnv creates a new test environment with the specified image size.
-// The image file is created in the shared host directory (bind-mounted to Docker)
-// so it's immediately accessible inside the container without docker cp.
+// The image is created in the shared host dir and streamed into the container
+// before use (see copyToContainer).
 func newTestEnv(t *testing.T, sizeMB int) *testEnv {
 	t.Helper()
 
@@ -3238,9 +3243,9 @@ func newTestEnv(t *testing.T, sizeMB int) *testEnv {
 }
 
 // newTestEnvOpts creates a test environment with arbitrary image options. The
-// image path (bind-mounted into Docker) is supplied automatically; callers add
-// size, label, etc. Useful for resize and label tests that need WithLabel or an
-// over-allocated canvas size.
+// image path (streamed into the container before use) is supplied automatically;
+// callers add size, label, etc. Useful for resize and label tests that need
+// WithLabel or an over-allocated canvas size.
 func newTestEnvOpts(t *testing.T, opts ...ext4fs.ImageOption) *testEnv {
 	t.Helper()
 
@@ -3290,6 +3295,8 @@ func (e *testEnv) runInContainer(script string) (stdout, stderr string, err erro
 func (e *testEnv) dumpe2fsHeader() string {
 	e.t.Helper()
 
+	e.copyToContainer()
+
 	remoteImage := filepath.Join(sharedContainerDir, filepath.Base(e.imagePath))
 
 	stdout, stderr, err := e.runInContainer(fmt.Sprintf("dumpe2fs -h %s 2>/dev/null", remoteImage))
@@ -3320,6 +3327,8 @@ func (e *testEnv) dockerExec(commands ...string) (stdout, stderr string, err err
 	if !dockerAvailable || dockerContainerID == "" {
 		return "", "", fmt.Errorf("docker test container not available")
 	}
+
+	e.copyToContainer()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -3357,18 +3366,40 @@ func (e *testEnv) dockerExecSimple(commands ...string) string {
 	return stdout
 }
 
+// copyToContainer streams the image into the container via stdin: no bind
+// mount, so snap-confined, rootless, and remote Docker daemons work.
+func (e *testEnv) copyToContainer() {
+	e.t.Helper()
+
+	f, err := os.Open(e.imagePath)
+	require.NoError(e.t, err, "failed to open image for container copy")
+	defer func() { _ = f.Close() }()
+
+	remoteImage := filepath.Join(sharedContainerDir, filepath.Base(e.imagePath))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", dockerContainerID,
+		"sh", "-c", fmt.Sprintf("cat > %s", remoteImage))
+	cmd.Stdin = f
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	require.NoError(e.t, cmd.Run(), "failed to stream image into container: %s", stderr.String())
+}
+
 // -----------------------------------------------------------------------------
 // Docker Container Management
 // -----------------------------------------------------------------------------
 
-// startDockerContainer starts a privileged Alpine container with the shared
-// host directory mounted and necessary tools installed.
+// startDockerContainer starts a privileged Alpine container with an
+// in-container images directory and necessary tools installed.
 func startDockerContainer() (string, error) {
-	volumeArg := fmt.Sprintf("%s:%s", sharedHostDir, sharedContainerDir)
-
 	cmd := exec.Command(
-		"docker", "run", "-d", "--privileged", "-v", volumeArg, dockerImage,
-		"sleep", "infinity",
+		"docker", "run", "-d", "--privileged", dockerImage,
+		"sh", "-c", fmt.Sprintf("mkdir -p %s && exec sleep infinity", sharedContainerDir),
 	)
 
 	var stdout, stderr bytes.Buffer
